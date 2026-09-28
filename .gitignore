@@ -1,0 +1,10 @@
+analysis/out/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.DS_Store
+CLAUDE.local.md
