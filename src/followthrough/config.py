@@ -35,7 +35,10 @@ DEFAULTS = {
     "macos": {"enabled": True, "terminal_app": "Terminal"},
     # open_button: an "Open on Mac" button + `/ft open` hint. Only useful when a process polling this bot's updates
     # handles callback data "ft:open:<id>" (by running `followthrough open-terminal <id>`); nothing here does.
-    "telegram": {"enabled": False, "env_file": "", "token_key": "BOT_TOKEN", "chat_id": "", "open_button": False},
+    # snooze_buttons: e.g. ["1h", "3h", "morning"] - one button each, callback data "ft:snooze:<id>:<for>", for the
+    # same process to run `followthrough snooze <id> --for <for>`.
+    "telegram": {"enabled": False, "env_file": "", "token_key": "BOT_TOKEN", "chat_id": "", "open_button": False,
+                 "snooze_buttons": []},
 }
 
 

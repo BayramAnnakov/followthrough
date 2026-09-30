@@ -130,23 +130,41 @@ def telegram_text(claim, cp, event, extra, tz, button=False):
     return fixed
 
 
-def telegram_message(cfg, text, claim_id=""):
-    """The sendMessage payload. The button is opt-in (telegram.open_button): its callback is handled only by a
-    process that polls this bot's updates, and without one it silently does nothing."""
-    msg = {"chat_id": str(cfg["telegram"]["chat_id"]), "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    if cfg["telegram"].get("open_button") and claim_id and claim_id != "ft-test":
-        msg["reply_markup"] = {"inline_keyboard": [[{"text": "▶ Open on Mac", "callback_data": f"ft:open:{claim_id}"}]]}
+CALLBACK_LIMIT = 64   # bytes of callback_data Telegram accepts
+
+
+def _snooze_label(dur):
+    return f"💤 till {timeparse.MORNING_HOUR}:00" if dur == "morning" else f"💤 {dur}"
+
+
+def telegram_message(cfg, text, claim_id="", event=""):
+    """The sendMessage payload. The buttons are opt-in (telegram.open_button, telegram.snooze_buttons): their
+    callbacks are handled only by a process that polls this bot's updates, and without one they silently do nothing."""
+    t = cfg["telegram"]
+    msg = {"chat_id": str(t["chat_id"]), "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    if not claim_id or claim_id == "ft-test":
+        return msg
+    rows = []
+    if t.get("open_button"):
+        rows.append([{"text": "▶ Open on Mac", "callback_data": f"ft:open:{claim_id}"}])
+    if event not in ("expired", "test"):
+        rows.append([{"text": _snooze_label(d), "callback_data": f"ft:snooze:{claim_id}:{d}"}
+                     for d in t.get("snooze_buttons") or [] if isinstance(d, str) and timeparse.SNOOZE_RE.fullmatch(d)])
+    # Telegram rejects the whole message when one button's data is too long: drop that button instead
+    rows = [r for r in ([b for b in row if len(b["callback_data"].encode()) <= CALLBACK_LIMIT] for row in rows) if r]
+    if rows:
+        msg["reply_markup"] = {"inline_keyboard": rows}
     return msg
 
 
-def telegram(cfg, text, claim_id=""):
+def telegram(cfg, text, claim_id="", event=""):
     t = cfg["telegram"]
     if not t.get("enabled"):
         return True, "disabled"
     token = _read_env_value(t.get("env_file", ""), t.get("token_key", "BOT_TOKEN"))
     if not token or not t.get("chat_id"):
         return False, "telegram not configured (token or chat_id missing)"
-    msg = telegram_message(cfg, text, claim_id)
+    msg = telegram_message(cfg, text, claim_id, event)
     tmp = None
     try:
         fd, tmp = tempfile.mkstemp(prefix="ft-tg-", suffix=".json")
@@ -174,7 +192,7 @@ def deliver_channel(cfg, channel, claim, cp, event, extra, bin_path):
             return macos(cfg, claim, event, bin_path)
         if channel == "telegram":
             text = telegram_text(claim, cp, event, extra, claim["tz"] or cfg["tz"], button=cfg["telegram"].get("open_button"))
-            return telegram(cfg, text, claim["id"])
+            return telegram(cfg, text, claim["id"], event)
         return False, f"unknown channel {channel}"
     except Exception as e:  # noqa: BLE001
         return False, type(e).__name__

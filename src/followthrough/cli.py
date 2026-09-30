@@ -50,6 +50,8 @@ def _fmt_claim_line(con, c, cfg, now):
         when, mark = "due " + timeparse.local_str(db.parse(cp["due_at"]), c["tz"] or cfg["tz"], now), "·"
     if c["status"] == "active" and db.parse(c["ends_at"]) < now:
         when, mark = "overdue · " + when, "!"
+    if c["status"] == "active" and core.snoozed(c, now):
+        when, mark = "snoozed till " + timeparse.local_str(db.parse(c["snoozed_until"]), c["tz"] or cfg["tz"], now) + " · " + when, "z"
     return f"  {mark} {c['id']:34} {when:30} {repo[-28:]:28} {c['title'][:70]}"
 
 
@@ -74,7 +76,7 @@ def cmd_status(a, con=None):
         out = []
         for c in rows:
             cp = core.current_checkpoint(con, c["id"])
-            out.append({k: c[k] for k in ("id", "kind", "title", "repo", "status", "ends_at", "origin")} |
+            out.append({k: c[k] for k in ("id", "kind", "title", "repo", "status", "ends_at", "origin", "snoozed_until")} |
                        {"checkpoint": dict(cp) if cp else None})
         print(json.dumps(out, indent=1))
         return 0
@@ -129,6 +131,8 @@ def cmd_show(a):
         print(f"overdue: since {ends} - it stays open until a verdict, or until you cancel or abandon it")
     else:
         print(f"ends:    {ends}")
+    if c["status"] == "active" and core.snoozed(c):
+        print(f"snoozed: until {timeparse.local_str(db.parse(c['snoozed_until']), tz)} - notifications are held until then")
     print("checkpoints:")
     for cp in core.checkpoints(con, c["id"]):
         print(f"  {cp['seq']}. {timeparse.local_str(db.parse(cp['due_at']), tz):18} {cp['role']:8} {cp['state']:12} "
@@ -328,6 +332,23 @@ def cmd_expect(a):
         return 0
     print("this claim already has an expectation; it is never edited - add a note instead", file=sys.stderr)
     return 1
+
+
+def cmd_snooze(a):
+    con, cfg = db.connect(), _cfg()
+    c = core.get(con, a.id)
+    tz = c["tz"] or cfg["tz"]
+    try:
+        until = (None if a.off else timeparse.snooze_until(a.for_, tz) if a.for_ else timeparse.parse_when(a.until, tz))
+        end = core.snooze(con, c["id"], until, source=a.source)
+    except (ValueError, core.NotSnoozed) as e:
+        print(e, file=sys.stderr)
+        return 1
+    if a.off:
+        print(f"snooze ended: {c['id']} (anything held goes out on the next tick)")
+    else:
+        print(f"snoozed {c['id']} until {timeparse.local_str(db.parse(end), tz)}")
+    return 0
 
 
 def cmd_note(a):
@@ -681,6 +702,14 @@ def main(argv=None):
 
     s = sub.add_parser("expect", help="set a claim's expectation once (for captured reminders; never edited later)")
     s.add_argument("id"), s.add_argument("text", nargs="+"), s.set_defaults(fn=cmd_expect)
+
+    s = sub.add_parser("snooze", help="hold a claim's notifications for a while; a reminder follows when it ends")
+    s.add_argument("id")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--for", dest="for_", metavar="FOR", help="30m, 3h, 2d, 1w, or morning (the next 09:00)")
+    g.add_argument("--until", help="a time: '2026-10-01 08:00' (local) or ISO with an offset")
+    g.add_argument("--off", action="store_true", help="end the snooze now")
+    s.add_argument("--source", default="cli"), s.set_defaults(fn=cmd_snooze)
 
     s = sub.add_parser("note", help="append a note to a claim's history")
     s.add_argument("id"), s.add_argument("text", nargs="+"), s.set_defaults(fn=cmd_note)

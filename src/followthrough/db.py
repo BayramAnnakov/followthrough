@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS claims (
     source_cron_id TEXT NOT NULL DEFAULT '',   -- the CronCreate job id (matches scheduledTaskId when it fires)
     source_event TEXT NOT NULL DEFAULT '',     -- the CronCreate tool_use id: identity of the capture
     confirmed INTEGER NOT NULL DEFAULT 1,      -- 0 while a hook capture waits for CronCreate to succeed
+    snoozed_until TEXT NOT NULL DEFAULT '',    -- its notifications are held until then (`snooze`)
     prompt_hash TEXT NOT NULL DEFAULT '',
     tz TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
@@ -113,8 +114,9 @@ MIGRATIONS = [  # (table, column, DDL) for databases created before the column e
     ("claims", "source_event", "ALTER TABLE claims ADD COLUMN source_event TEXT NOT NULL DEFAULT ''"),
     ("claims", "confirmed", "ALTER TABLE claims ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 1"),
     ("attempts", "pid_start", "ALTER TABLE attempts ADD COLUMN pid_start TEXT NOT NULL DEFAULT ''"),
+    ("claims", "snoozed_until", "ALTER TABLE claims ADD COLUMN snoozed_until TEXT NOT NULL DEFAULT ''"),
 ]
-SCHEMA_VERSION = 3   # bump with every SCHEMA/MIGRATIONS change; connect() skips all schema work when current
+SCHEMA_VERSION = 4   # bump with every SCHEMA/MIGRATIONS change; connect() skips all schema work when current
 
 FMT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -176,7 +178,11 @@ def connect(fast=False):
             for table, column, ddl in MIGRATIONS:
                 cols = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
                 if cols and column not in cols:
-                    con.execute(ddl)
+                    try:
+                        con.execute(ddl)
+                    except sqlite3.OperationalError as e:   # another process added it first
+                        if "duplicate column" not in str(e):
+                            raise
             con.executescript(SCHEMA)
             con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     finally:

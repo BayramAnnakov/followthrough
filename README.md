@@ -48,7 +48,9 @@ By hand afterwards:
 - `brew install terminal-notifier` - clickable macOS notifications.
 - Telegram (optional): `[telegram] enabled = true`, `env_file`, `token_key`, `chat_id`. `open_button = true` adds an
   "Open on Mac" button to each message; it only works if a process polling that bot's updates handles callback data
-  `ft:open:<id>` by running `followthrough open-terminal <id>`. followthrough does not ship that handler yet.
+  `ft:open:<id>` by running `followthrough open-terminal <id>`. `snooze_buttons = ["1h", "3h", "morning"]` adds a
+  row of snooze buttons; their callback data is `ft:snooze:<id>:<for>`, for the same process to run
+  `followthrough snooze <id> --for <for> --source telegram-button`. followthrough does not ship that handler yet.
 - Codex: add `~/.followthrough/data` to `[sandbox_workspace_write] writable_roots` in `~/.codex/config.toml`, and a
   line to `~/.codex/AGENTS.md` pointing at the skill.
 
@@ -93,6 +95,7 @@ followthrough start <id>                          take the lease (prints OK <att
 followthrough resolve <id> --attempt <attempt-id> --verdict worked|failed|partial|inconclusive|not_settled --summary "…"
 followthrough amend <id> --verdict … --summary "…" --reason "…"   change a closed verdict when the user asks
 followthrough expect <id> "…"                     set a captured claim's expectation (once)
+followthrough snooze <id> --for 3h|morning      hold its notifications; one reminder follows (--off to end)
 followthrough cancel <id> --reason "…"           (or abandon: no longer worth checking)
 followthrough show <id>                           checkpoints and history
 followthrough import-crons [--rescan]             scan transcripts now

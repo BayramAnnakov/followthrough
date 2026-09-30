@@ -97,6 +97,11 @@ the reminder, so the context comes back.
 Reminders and overdue notices are sent only between 08:00 and 21:00 local time; due and fired notices are sent
 when they happen.
 
+`followthrough snooze <id> --for 3h` (or a Telegram snooze button) holds a claim's notifications. Nothing else
+changes: checkpoints still become due, and what they queue waits in the outbox. When the snooze ends, you get one
+notice per channel: the latest held one that still applies, or else a reminder if the claim still needs you. A verdict
+ends a snooze. A notice already being sent when the snooze is set can still arrive.
+
 ### Overview
 
 `followthrough status` lists what needs you, what is running and what is due, most urgent first. A `SessionStart`
@@ -150,6 +155,6 @@ The author's machine, 23-27 Sep 2026 (one person, one week - read the numbers as
 - **Linux** (the runner is a launchd job; notifications use `osascript` / `terminal-notifier`).
 - **Unattended checks.** Running a check with no person present (a restricted agent session, or declared read-only
   collectors with no model at all) is designed but not built; today every check is opened by a person.
-- **The Telegram "Open on Mac" button handler.** The button is opt-in; something that polls the bot's updates has
-  to handle it, and nothing in this repo does yet.
+- **The Telegram button handler** ("Open on Mac", snooze). The buttons are opt-in; something that polls the bot's
+  updates has to handle them, and nothing in this repo does yet.
 - **Quiet hours for due and fired notices**, and the other known gaps in `BACKLOG.md`.

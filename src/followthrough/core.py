@@ -27,8 +27,14 @@ def quiet_reading(claim, cp):
             and cp["summary"].startswith(RAN_IN_SESSION))
 
 
-def needs_you(claim, cp):
-    return cp is not None and cp["state"] == "needs_human" and not quiet_reading(claim, cp)
+def snoozed(claim, now=None):
+    """True while the claim's notifications are held (`snooze`)."""
+    return bool(claim["snoozed_until"]) and claim["snoozed_until"] > db.iso(now or db.now())
+
+
+def needs_you(claim, cp, now=None):
+    return (cp is not None and cp["state"] == "needs_human" and not quiet_reading(claim, cp)
+            and not snoozed(claim, now))
 
 
 def auto_expired(claim):
@@ -405,6 +411,7 @@ def resolve(con, ref, verdict, summary="", retry_at=None, final=False, checkpoin
         if cp is None:
             db.event(con, cid, "note", f"{verdict}: {summary}")
             return "no matching open checkpoint; recorded as a note"
+        con.execute("UPDATE claims SET snoozed_until='' WHERE id=?", (cid,))   # a snooze was about this checkpoint
         con.execute("UPDATE attempts SET ended_at=?, outcome=? WHERE checkpoint_id=? AND ended_at=''",
                     (db.iso(now), verdict, cp["id"]))
         if verdict == "not_settled":
@@ -504,6 +511,34 @@ def expect(con, ref, text):
         if n:
             db.event(con, claim["id"], "expectation", redact(text)[:300])
     return n == 1
+
+
+MAX_SNOOZE = dt.timedelta(days=30)
+
+
+class NotSnoozed(Exception):
+    pass
+
+
+def snooze(con, ref, until, source="cli"):
+    """Hold the claim's notifications until `until`; `until=None` ends the snooze now. The runner holds what it
+    queues meanwhile and, when the snooze ends, sends one notice (runner.transitions step 0). A verdict ends it too.
+    Returns the new snoozed_until (UTC string)."""
+    claim = get(con, ref)
+    now = db.now()
+    if until is not None and not now < until <= now + MAX_SNOOZE:
+        raise NotSnoozed(f"a snooze must end in the future and within {MAX_SNOOZE.days} days")
+    with db.tx(con):
+        c = con.execute("SELECT * FROM claims WHERE id=?", (claim["id"],)).fetchone()
+        if c["status"] != "active":
+            raise NotSnoozed(f"{c['id']} is {c['status']}; nothing to snooze")
+        if until is None:
+            if not snoozed(c, now):
+                raise NotSnoozed(f"{c['id']} is not snoozed")
+            until = now   # the next tick ends it, and sends what was held
+        con.execute("UPDATE claims SET snoozed_until=? WHERE id=?", (db.iso(until), c["id"]))
+        db.event(con, c["id"], "snoozed" if until > now else "unsnoozed", f"until {db.iso(until)} ({source})", at=now)
+    return db.iso(until)
 
 
 def note(con, ref, text):

@@ -23,6 +23,25 @@ def parse_when(text, tz, now=None):
     return t.astimezone(UTC)
 
 
+SNOOZE_RE = re.compile(r"\d{1,4}(m|h|d|w)|morning")
+MORNING_HOUR = 9
+
+
+def snooze_until(text, tz, now=None):
+    """End of a snooze: '30m', '3h', '2d', '1w', or 'morning' (the next 09:00 local)."""
+    now = now or dt.datetime.now(UTC)
+    s = text.strip().lower()
+    if not SNOOZE_RE.fullmatch(s):
+        raise ValueError(f"snooze for 30m, 3h, 2d, 1w or morning - not {text!r}")
+    if s != "morning":
+        return parse_when(s, tz, now)
+    day = now.astimezone(ZoneInfo(tz)).date()
+    for d in (day, day + dt.timedelta(days=1)):
+        at = to_utc(dt.datetime.combine(d, dt.time(MORNING_HOUR)), tz)[0]
+        if at > now:
+            return at
+
+
 def to_utc(naive, tz):
     """UTC instants for a local wall time: two for an ambiguous (fall-back) time, and for a non-existent
     (spring-forward) time the instant just after the gap, i.e. the wall time shifted forward by the gap."""

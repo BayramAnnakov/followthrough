@@ -1271,3 +1271,189 @@ def test_a_secret_in_a_reminder_still_gives_one_claim(con, cfg, capsys, tmp_path
     assert len([c for c in claims(con) if c["status"] == "active"]) == 1
     pending = [json.loads(r["input"]) for r in con.execute("SELECT input FROM pending_uses")]
     assert all(set(p) <= {"cron", "recurring", "id", "prompt", "_tool"} for p in pending)
+
+
+# ---------------------------------------------------------------- snooze
+
+def test_snooze_holds_notices_and_sends_them_when_it_ends(con, cfg):
+    cfg["tz"] = LA
+    cid = add(con, dues=[(t(-3), "final")], ends_at=t(days=5))
+    core.snooze(con, cid, la_at(1, 12), source="test")
+    s = Sender()
+    tick(con, cfg, now=la_at(1, 10), send=s)                     # due while snoozed: queued, held
+    assert s.events(cid) == [] and core.current_checkpoint(con, cid)["state"] == "needs_human"
+    tick(con, cfg, now=la_at(1, 12), send=s)                     # snooze over: the held notice goes, no extra reminder
+    tick(con, cfg, now=la_at(1, 13), send=s)
+    assert s.events(cid) == ["due"]
+    assert core.get(con, cid)["snoozed_until"] == ""
+    assert [e["kind"] for e in core.events(con, cid)].count("snooze_over") == 1
+
+
+def test_snooze_after_a_notice_sends_one_reminder_in_waking_hours(con, cfg):
+    cfg["tz"] = LA
+    cid = add(con, dues=[(t(-3), "final")], ends_at=t(days=5))
+    s = Sender()
+    tick(con, cfg, now=la_at(1, 10), send=s)
+    assert s.events(cid) == ["due"]
+    core.snooze(con, cid, la_at(1, 22))
+    tick(con, cfg, now=la_at(1, 15), send=s)
+    tick(con, cfg, now=la_at(1, 22), send=s)                     # ends at night: the reminder waits for 08:00
+    assert s.events(cid) == ["due"]
+    tick(con, cfg, now=la_at(2, 8), send=s)
+    tick(con, cfg, now=la_at(2, 9), send=s)                      # not a second one: notified_at moved at the wake
+    assert s.events(cid) == ["due", "reminder"]
+    row = con.execute("SELECT extra FROM outbox WHERE claim_id=? AND event='reminder'", (cid,)).fetchone()
+    assert row["extra"] == "The snooze is over."
+    c, cp = core.get(con, cid), core.current_checkpoint(con, cid)
+    assert "The snooze is over." in notify.telegram_text(c, cp, "reminder", row["extra"], LA)
+
+
+def test_snooze_on_an_overdue_claim_ends_with_one_overdue_notice(con, cfg):
+    cfg["tz"] = LA
+    cid = add(con, dues=[(t(-3), "final")], ends_at=t(-1))
+    s = Sender()
+    tick(con, cfg, now=la_at(1, 10), send=s)
+    assert s.events(cid) == ["overdue", "due"]
+    core.snooze(con, cid, la_at(1, 12))
+    tick(con, cfg, now=la_at(1, 12), send=s)
+    tick(con, cfg, now=la_at(1, 13), send=s)
+    tick(con, cfg, now=la_at(2, 13), send=s)
+    tick(con, cfg, now=la_at(8, 11), send=s)                     # a week after the first notice, not after the wake
+    assert s.events(cid) == ["overdue", "due", "overdue"]
+    tick(con, cfg, now=la_at(8, 13), send=s)                     # the weekly rhythm restarts from the wake
+    assert s.events(cid) == ["overdue", "due", "overdue", "overdue"]
+
+
+def test_a_verdict_ends_the_snooze_and_closed_claims_cannot_be_snoozed(con, cfg):
+    series = add(con, dues=[(t(-2), "interim"), (t(days=2), "final")], kind="watch")
+    core.snooze(con, series, t(10))
+    core.resolve(con, series, "worked", "reading 1", checkpoint=1)
+    assert core.get(con, series)["snoozed_until"] == ""            # the next reading notifies as usual
+    done = add(con, dues=[(t(-1), "final")])
+    core.resolve(con, done, "worked", "p95 8 s")
+    with pytest.raises(core.NotSnoozed):
+        core.snooze(con, done, t(3))
+    with pytest.raises(core.NotSnoozed):
+        core.snooze(con, series, t(-1))                             # in the past
+    with pytest.raises(core.NotSnoozed):
+        core.snooze(con, series, t(days=31))
+    with pytest.raises(core.NotSnoozed):
+        core.snooze(con, series, None)                              # --off when not snoozed
+
+
+def test_snooze_cli_and_status(con, cfg, capsys):
+    cid = add(con, dues=[(t(-3), "final")])
+    con.execute("UPDATE checkpoints SET state='needs_human' WHERE claim_id=?", (cid,))
+    assert cli.main(["snooze", cid, "--for", "3h", "--source", "telegram-button"]) == 0
+    assert f"snoozed {cid} until" in capsys.readouterr().out
+    assert "snoozed" in [e["kind"] for e in core.events(con, cid)]
+    assert "telegram-button" in core.events(con, cid)[-1]["detail"]
+    cli.main(["status"])
+    out = capsys.readouterr().out
+    assert out.startswith("0 need you") and "snoozed till" in out
+    cli.main(["show", cid])
+    assert "snoozed: until" in capsys.readouterr().out
+    assert cli.main(["snooze", cid, "--for", "3 hours"]) == 1
+    assert "snooze for" in capsys.readouterr().err
+    assert cli.main(["snooze", cid, "--off"]) == 0
+    assert not core.snoozed(core.get(con, cid), t(0, 1))
+    s = Sender()
+    tick(con, cfg, now=la_at(1, 10), send=s)                     # the next tick ends it and sends one reminder
+    assert core.get(con, cid)["snoozed_until"] == "" and s.events(cid) == ["reminder"]
+
+
+def test_snooze_until_morning():
+    from zoneinfo import ZoneInfo
+    z = ZoneInfo(LA)
+    at = lambda *a: dt.datetime(*a, tzinfo=z).astimezone(UTC)  # noqa: E731
+    assert timeparse.snooze_until("morning", LA, at(2026, 10, 1, 7, 30)) == at(2026, 10, 1, 9)
+    assert timeparse.snooze_until("morning", LA, at(2026, 10, 1, 9)) == at(2026, 10, 2, 9)
+    assert timeparse.snooze_until("morning", LA, at(2026, 10, 31, 22)) == at(2026, 11, 1, 9)  # across the DST end
+    assert at(2026, 11, 1, 9) - at(2026, 10, 31, 22) == dt.timedelta(hours=12)
+    assert timeparse.snooze_until("morning", LA, at(2027, 3, 13, 22)) == at(2027, 3, 14, 9)   # across the DST start
+    assert at(2027, 3, 14, 9) - at(2027, 3, 13, 22) == dt.timedelta(hours=10)
+    assert timeparse.snooze_until("90m", LA, at(2026, 10, 1, 7)) == at(2026, 10, 1, 8, 30)
+    for bad in ("", "+3h", "3 h", "tomorrow", "0.5h"):
+        with pytest.raises(ValueError):
+            timeparse.snooze_until(bad, LA)
+
+
+def test_telegram_snooze_buttons_are_opt_in(con):
+    cid = add(con)
+    off = copy.deepcopy(config.DEFAULTS)
+    off["telegram"]["chat_id"] = "1"
+    assert "reply_markup" not in notify.telegram_message(off, "x", cid, "due")
+    on = copy.deepcopy(off)
+    on["telegram"]["snooze_buttons"] = ["1h", "morning", "bad value", 3]
+    rows = notify.telegram_message(on, "x", cid, "due")["reply_markup"]["inline_keyboard"]
+    assert [b["callback_data"] for b in rows[0]] == [f"ft:snooze:{cid}:1h", f"ft:snooze:{cid}:morning"]
+    assert rows[0][1]["text"] == "💤 till 9:00"
+    on["telegram"]["open_button"] = True
+    rows = notify.telegram_message(on, "x", cid, "reminder")["reply_markup"]["inline_keyboard"]
+    assert rows[0][0]["callback_data"] == f"ft:open:{cid}" and len(rows[1]) == 2
+    assert len(notify.telegram_message(on, "x", cid, "expired")["reply_markup"]["inline_keyboard"]) == 1
+    assert "reply_markup" not in notify.telegram_message(on, "x", "ft-test", "test")
+    long_id = "ft-" + "a" * 50                                   # callback data over Telegram's 64 bytes: no button
+    assert [b["callback_data"] for r in notify.telegram_message(on, "x", long_id, "due")["reply_markup"]["inline_keyboard"]
+            for b in r] == [f"ft:open:{long_id}"]
+    assert "reply_markup" not in notify.telegram_message(on, "x", "ft-" + "a" * 60, "due")
+
+
+def test_snooze_column_is_added_to_an_old_ledger(tmp_path, monkeypatch):
+    import sqlite3
+    monkeypatch.setenv("FOLLOWTHROUGH_HOME", str(tmp_path / "h"))
+    db.connect().close()
+    p = tmp_path / "h" / "data" / "followthrough.db"
+    c = sqlite3.connect(p)
+    c.execute("ALTER TABLE claims DROP COLUMN snoozed_until")
+    c.execute("PRAGMA user_version=3")
+    c.commit()
+    c.close()
+    con = db.connect()
+    assert "snoozed_until" in {r[1] for r in con.execute("PRAGMA table_info(claims)")}
+
+
+def test_a_long_snooze_ends_with_one_notice_per_channel(con, cfg):
+    cfg["tz"] = LA
+    cid = add(con, dues=[(t(-3), "final")], ends_at=t(days=10))
+    s = Sender()
+    tick(con, cfg, now=la_at(1, 10), send=s)
+    core.snooze(con, cid, la_at(4, 10))
+    for d in (2, 3):                                             # no daily reminder piles up while snoozed
+        tick(con, cfg, now=la_at(d, 11), send=s)
+    assert not con.execute("SELECT 1 FROM outbox WHERE claim_id=? AND event='reminder'", (cid,)).fetchone()
+    tick(con, cfg, now=la_at(4, 10), send=s)
+    tick(con, cfg, now=la_at(4, 12), send=s)
+    assert s.events(cid) == ["due", "reminder"]
+    tick(con, cfg, now=la_at(5, 11), send=s)                     # the daily rhythm restarts from the wake
+    tick(con, cfg, now=la_at(6, 10), send=s)
+    assert s.events(cid) == ["due", "reminder", "reminder"]
+
+
+def test_snooze_end_is_not_swallowed_by_another_channels_retry(con, cfg):
+    cfg["tz"] = LA
+    cid = add(con, dues=[(t(-3), "final")], ends_at=t(days=10))
+    sent = []
+
+    def send(cfg, channel, claim, cp, event, extra, bin_path):   # Telegram works, macOS keeps failing
+        if channel == "macos":
+            return False, "boom"
+        sent.append(event)
+        return True, "ok"
+    tick(con, cfg, now=la_at(1, 10), send=send)
+    core.snooze(con, cid, la_at(1, 12))
+    tick(con, cfg, now=la_at(1, 12), send=send)                  # the macOS retry is held, then superseded
+    assert sent == ["due", "due"]
+    pending = con.execute("SELECT channel FROM outbox WHERE claim_id=? AND sent_at='' AND gave_up_at=''", (cid,)).fetchall()
+    assert [r["channel"] for r in pending] == ["macos"]          # one notice left to retry, not two
+
+
+def test_a_held_notice_that_became_obsolete_gives_way_to_the_reminder(con, cfg):
+    cfg["tz"] = LA
+    cid = add(con, dues=[(t(-3), "final")], ends_at=t(days=10))
+    core.snooze(con, cid, la_at(1, 12))
+    tick(con, cfg, now=la_at(1, 10))                             # due queued and held
+    con.execute("UPDATE outbox SET event='expired' WHERE claim_id=?", (cid,))   # a legacy row: never relevant here
+    s = Sender()
+    tick(con, cfg, now=la_at(1, 12), send=s)
+    assert s.events(cid) == ["reminder"]

@@ -92,6 +92,40 @@ def transitions(con, cfg, now, root=None):
     log = []
     waking = 8 <= _local_hour(cfg["tz"], now) < 21
 
+    # 0. Snoozes that ended. Transitions below run as usual during a snooze and deliver holds what they queue. The
+    # held notices collapse into one on every channel: the latest one still relevant, else a reminder (or the overdue
+    # notice) if the claim needs you. The reminder rhythm restarts from now.
+    for c in con.execute("SELECT * FROM claims WHERE status='active' AND snoozed_until!='' AND snoozed_until<=?",
+                         (db.iso(now),)).fetchall():
+        with db.tx(con):
+            if con.execute("UPDATE claims SET snoozed_until='' WHERE id=? AND status='active' AND snoozed_until=?",
+                           (c["id"], c["snoozed_until"])).rowcount != 1:
+                continue
+            db.event(con, c["id"], "snooze_over", f"snoozed until {c['snoozed_until']}", at=now)
+            claim = con.execute("SELECT * FROM claims WHERE id=?", (c["id"],)).fetchone()
+            pick = None
+            for r in con.execute("SELECT * FROM outbox WHERE claim_id=? AND sent_at='' AND gave_up_at='' ORDER BY id DESC",
+                                 (c["id"],)).fetchall():
+                rcp = con.execute("SELECT * FROM checkpoints WHERE id=?", (r["checkpoint_id"],)).fetchone() if r["checkpoint_id"] else None
+                if _still_relevant(r, claim, rcp, now):
+                    pick = (r["event"], r["checkpoint_id"], r["extra"])
+                    break
+            con.execute("UPDATE outbox SET gave_up_at=?, last_error='obsolete' WHERE claim_id=? AND sent_at='' AND gave_up_at=''",
+                        (db.iso(now), c["id"]))
+            cp = core.current_checkpoint(con, c["id"])
+            if pick is None and claim["ends_at"] < db.iso(now):
+                db.event(con, c["id"], "overdue", f"past {claim['ends_at']} without a verdict; still open", at=now)
+                pick = ("overdue", None, "The snooze is over.")
+            elif pick is None and core.needs_you(claim, cp, now):
+                pick = ("reminder", cp["id"], "The snooze is over.")
+            if pick is None:
+                log.append(f"snooze over {c['id']} (nothing needs you)")
+                continue
+            if cp is not None and cp["state"] == "needs_human":
+                con.execute("UPDATE checkpoints SET notified_at=? WHERE id=?", (db.iso(now), cp["id"]))
+            db.enqueue(con, c["id"], pick[1], pick[0], pick[2], at=now)
+        log.append(f"snooze over {c['id']} ({pick[0]})")
+
     # 1. Overdue: a claim past ends_at stays open - only a verdict or a person (cancel, abandon) closes it. It gets an
     # "overdue" notice in waking hours, repeated weekly (and anew after a not_settled retry moved ends_at).
     if waking:
@@ -141,12 +175,13 @@ def transitions(con, cfg, now, root=None):
             log.append(f"ERROR on {cp['claim_id']}: {type(e).__name__}: {core.redact(str(e))[:200]}")
 
     # 4. Re-notify "needs you" at most every renotify_hours, in waking hours; never for ones that ran in session,
-    # nor for overdue claims (step 1 reminds those weekly).
+    # nor for overdue claims (step 1 reminds those weekly), nor while snoozed.
     if waking:
         cutoff = db.iso(now - dt.timedelta(hours=cfg["renotify_hours"]))
         for cp in con.execute("SELECT cp.* FROM checkpoints cp JOIN claims c ON c.id=cp.claim_id WHERE c.status='active'"
-                              " AND c.ends_at>=? AND cp.state='needs_human' AND cp.notified_at<? AND cp.summary NOT LIKE ?",
-                              (db.iso(now), cutoff, RAN_IN_SESSION + "%")).fetchall():
+                              " AND c.ends_at>=? AND cp.state='needs_human' AND cp.notified_at<? AND cp.summary NOT LIKE ?"
+                              " AND c.snoozed_until<=?",   # a snooze sends one reminder when it ends (step 0)
+                              (db.iso(now), cutoff, RAN_IN_SESSION + "%", db.iso(now))).fetchall():
             with db.tx(con):
                 n = con.execute("UPDATE checkpoints SET notified_at=? WHERE id=? AND state='needs_human' AND notified_at<?",
                                 (db.iso(now), cp["id"], cutoff)).rowcount
@@ -188,6 +223,8 @@ def deliver(con, cfg, bin_path, now, send=None):
         try:
             claim = con.execute("SELECT * FROM claims WHERE id=?", (r["claim_id"],)).fetchone()
             cp = con.execute("SELECT * FROM checkpoints WHERE id=?", (r["checkpoint_id"],)).fetchone() if r["checkpoint_id"] else None
+            if claim is not None and claim["status"] == "active" and core.snoozed(claim, now):
+                continue            # held until the snooze ends (transitions step 0)
             if not _still_relevant(r, claim, cp, now):
                 con.execute("UPDATE outbox SET gave_up_at=?, last_error='obsolete' WHERE id=?", (db.iso(now), r["id"]))
                 log.append(f"dropped obsolete {r['channel']} {r['event']} {r['claim_id']}")

@@ -90,3 +90,6 @@ When the reminder is a check on a change, give the claim its expectation while y
 
 `followthrough status` (most urgent first; `--repo .` for this project), `followthrough show <id>` (checkpoints
 and history), `followthrough open <id>` (start a session for a check), `followthrough cancel <id> --reason ...`.
+When the user wants a check later but still wants it ("snooze it", "remind me tomorrow"):
+`followthrough snooze <id> --for 3h` (or `--for morning`, `--until "2026-10-01 08:00"`). It holds the notifications
+and does not close or move the check; a verdict ends the snooze.
