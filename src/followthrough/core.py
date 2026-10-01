@@ -495,12 +495,16 @@ def discard_provisional(con, cid):
 
 
 def close(con, ref, status, reason):
-    """Cancel or abandon a claim."""
+    """Cancel or abandon a claim. Returns its status before: anything but "active" means nothing changed (a stale
+    Telegram button must not log a second close)."""
     if status not in ("cancelled", "abandoned"):
         raise ValueError("status must be cancelled or abandoned")
     claim = get(con, ref)
     with db.tx(con):
-        _close_in_tx(con, claim["id"], status, reason)
+        was = con.execute("SELECT status FROM claims WHERE id=?", (claim["id"],)).fetchone()["status"]
+        if was == "active":
+            _close_in_tx(con, claim["id"], status, reason)
+    return was
 
 
 def expect(con, ref, text):

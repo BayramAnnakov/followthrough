@@ -320,7 +320,10 @@ def cmd_amend(a):
 
 def cmd_close(a, status):
     con = db.connect()
-    core.close(con, a.id, status, a.reason)
+    was = core.close(con, a.id, status, a.reason)
+    if was != "active":
+        print(f"{a.id} is already closed ({was}); nothing changed", file=sys.stderr)
+        return 1
     print(f"{status}: {a.id}")
     return 0
 

@@ -155,6 +155,6 @@ The author's machine, 23-27 Sep 2026 (one person, one week - read the numbers as
 - **Linux** (the runner is a launchd job; notifications use `osascript` / `terminal-notifier`).
 - **Unattended checks.** Running a check with no person present (a restricted agent session, or declared read-only
   collectors with no model at all) is designed but not built; today every check is opened by a person.
-- **The Telegram button handler** ("Open on Mac", snooze). The buttons are opt-in; something that polls the bot's
+- **The Telegram button handler** ("Open on Mac", snooze, close). The buttons are opt-in; something that polls the bot's
   updates has to handle them, and nothing in this repo does yet.
 - **Quiet hours for due and fired notices**, and the other known gaps in `BACKLOG.md`.
