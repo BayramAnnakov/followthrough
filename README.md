@@ -104,6 +104,21 @@ followthrough install | install-hooks | install-runner | uninstall-runner
 
 Tests, from the clone: `cd followthrough && uv venv .venv && uv pip install -e . pytest && .venv/bin/python -m pytest`.
 
+## In the session: followthrough-band (Claude Code mod, early access)
+
+A [Claude Code mod](https://claude.dev/blog/getting-started-with-claude-code-mods/) puts the checks due for the repo
+you are in above the prompt, with **Run**, **Snooze 1d** and **Close**, and nudges a session that ships (a merge, a
+deploy, a publish) without registering a check.
+
+![followthrough-band: two overdue checks above the prompt](docs/followthrough-band.png)
+
+```bash
+claude plugin marketplace add bayramannakov/followthrough
+claude plugin install followthrough-band@followthrough
+```
+
+Needs the CLI above and Claude Code 2.1.286+ with mods. Details: [`mod/README.md`](mod/README.md).
+
 ## Uninstall
 
 ```
