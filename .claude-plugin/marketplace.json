@@ -1,0 +1,12 @@
+{
+  "name": "followthrough",
+  "description": "followthrough's Claude Code add-ons",
+  "owner": { "name": "Bayram Annakov" },
+  "plugins": [
+    {
+      "name": "followthrough-band",
+      "source": "./mod",
+      "description": "Due followthrough checks above the Claude Code prompt (Run / Snooze / Close), and a nudge when a session ships without registering a check"
+    }
+  ]
+}

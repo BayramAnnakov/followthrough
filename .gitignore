@@ -8,3 +8,7 @@ dist/
 build/
 .DS_Store
 CLAUDE.local.md
+
+# Written by Claude Code when it loads the mod from this folder
+mod/tsconfig.json
+mod/.claude-plugin/types/

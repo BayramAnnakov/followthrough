@@ -1,0 +1,12 @@
+{
+  "name": "followthrough-band",
+  "version": "0.1.0",
+  "description": "Due followthrough checks for this repo above the prompt (Run / Snooze / Close), and a nudge when the session ships without registering a check",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Bayram Annakov",
+    "url": "https://github.com/bayramannakov"
+  },
+  "repository": "https://github.com/bayramannakov/followthrough",
+  "license": "MIT"
+}
