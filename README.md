@@ -50,7 +50,11 @@ By hand afterwards:
   "Open on Mac" button to each message; it only works if a process polling that bot's updates handles callback data
   `ft:open:<id>` by running `followthrough open-terminal <id>`. `snooze_buttons = ["1h", "3h", "morning"]` adds a
   row of snooze buttons; their callback data is `ft:snooze:<id>:<for>`, for the same process to run
-  `followthrough snooze <id> --for <for> --source telegram-button`. followthrough does not ship that handler yet.
+  `followthrough snooze <id> --for <for> --source telegram-button`. `close_button = true` ends that row with a
+  "close" button, `ft:close:<id>` (it adds a button: `snooze_buttons = ["3h", "morning"]` with it gives "3h, till
+  9:00, close"), for closing a check without running it: the handler asks for a second tap
+  (`ft:close:<id>:y`) and then runs `followthrough abandon <id> --reason "…"`. followthrough does not ship that
+  handler yet.
 - Codex: add `~/.followthrough/data` to `[sandbox_workspace_write] writable_roots` in `~/.codex/config.toml`, and a
   line to `~/.codex/AGENTS.md` pointing at the skill.
 

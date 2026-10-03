@@ -37,8 +37,10 @@ DEFAULTS = {
     # handles callback data "ft:open:<id>" (by running `followthrough open-terminal <id>`); nothing here does.
     # snooze_buttons: e.g. ["1h", "3h", "morning"] - one button each, callback data "ft:snooze:<id>:<for>", for the
     # same process to run `followthrough snooze <id> --for <for>`.
+    # close_button: a "close" button after them, callback data "ft:close:<id>", for the same process to confirm (a second
+    # tap, "ft:close:<id>:y") and then run `followthrough abandon <id>` - the check is closed without being run.
     "telegram": {"enabled": False, "env_file": "", "token_key": "BOT_TOKEN", "chat_id": "", "open_button": False,
-                 "snooze_buttons": []},
+                 "snooze_buttons": [], "close_button": False},
 }
 
 

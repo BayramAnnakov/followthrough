@@ -1399,6 +1399,36 @@ def test_telegram_snooze_buttons_are_opt_in(con):
     assert "reply_markup" not in notify.telegram_message(on, "x", "ft-" + "a" * 60, "due")
 
 
+def test_telegram_close_button_ends_the_snooze_row_and_leaves_room_to_confirm(con):
+    cid = add(con)
+    on = copy.deepcopy(config.DEFAULTS)
+    on["telegram"].update(chat_id="1", snooze_buttons=["3h", "morning"], close_button=True)
+    rows = notify.telegram_message(on, "x", cid, "due")["reply_markup"]["inline_keyboard"]
+    assert [b["callback_data"] for b in rows[0]] == [f"ft:snooze:{cid}:3h", f"ft:snooze:{cid}:morning", f"ft:close:{cid}"]
+    on["telegram"]["snooze_buttons"] = []
+    assert notify.telegram_message(on, "x", cid, "overdue")["reply_markup"]["inline_keyboard"] == [
+        [{"text": "✖ close", "callback_data": f"ft:close:{cid}"}]]
+    assert "reply_markup" not in notify.telegram_message(on, "x", cid, "expired")
+    assert "reply_markup" not in notify.telegram_message(on, "x", "ft-test", "test")
+    fits = "ft-" + "a" * (64 - len("ft:close:") - len(":y") - 3)   # its confirmation "ft:close:<id>:y" is 64 bytes
+    assert notify.telegram_message(on, "x", fits, "due")["reply_markup"]
+    assert "reply_markup" not in notify.telegram_message(on, "x", fits + "a", "due")
+
+
+def test_closing_a_closed_claim_changes_nothing(con, capsys):
+    cid = add(con)
+    assert core.resolve(con, cid, "worked", "fine", final=True)
+    assert core.close(con, cid, "abandoned", "stale button") == "worked"
+    c = core.get(con, cid)
+    assert c["status"] == "worked" and c["verdict_summary"] != "stale button"
+    assert not con.execute("SELECT 1 FROM events WHERE claim_id=? AND kind='abandoned'", (cid,)).fetchone()
+    assert cli.main(["abandon", cid, "--reason", "stale button"]) == 1
+    assert "already closed (worked)" in capsys.readouterr().err
+    other = add(con, title="another one")
+    assert cli.main(["abandon", other, "--reason", "closed from Telegram"]) == 0
+    assert core.get(con, other)["status"] == "abandoned"
+
+
 def test_snooze_column_is_added_to_an_old_ledger(tmp_path, monkeypatch):
     import sqlite3
     monkeypatch.setenv("FOLLOWTHROUGH_HOME", str(tmp_path / "h"))

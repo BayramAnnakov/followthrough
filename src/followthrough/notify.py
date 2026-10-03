@@ -138,7 +138,7 @@ def _snooze_label(dur):
 
 
 def telegram_message(cfg, text, claim_id="", event=""):
-    """The sendMessage payload. The buttons are opt-in (telegram.open_button, telegram.snooze_buttons): their
+    """The sendMessage payload. The buttons are opt-in (telegram.open_button, .snooze_buttons, .close_button): their
     callbacks are handled only by a process that polls this bot's updates, and without one they silently do nothing."""
     t = cfg["telegram"]
     msg = {"chat_id": str(t["chat_id"]), "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -148,10 +148,15 @@ def telegram_message(cfg, text, claim_id="", event=""):
     if t.get("open_button"):
         rows.append([{"text": "▶ Open on Mac", "callback_data": f"ft:open:{claim_id}"}])
     if event not in ("expired", "test"):
-        rows.append([{"text": _snooze_label(d), "callback_data": f"ft:snooze:{claim_id}:{d}"}
-                     for d in t.get("snooze_buttons") or [] if isinstance(d, str) and timeparse.SNOOZE_RE.fullmatch(d)])
-    # Telegram rejects the whole message when one button's data is too long: drop that button instead
-    rows = [r for r in ([b for b in row if len(b["callback_data"].encode()) <= CALLBACK_LIMIT] for row in rows) if r]
+        row = [{"text": _snooze_label(d), "callback_data": f"ft:snooze:{claim_id}:{d}"}
+               for d in t.get("snooze_buttons") or [] if isinstance(d, str) and timeparse.SNOOZE_RE.fullmatch(d)]
+        if t.get("close_button"):
+            row.append({"text": "✖ close", "callback_data": f"ft:close:{claim_id}"})
+        rows.append(row)
+    # Telegram rejects the whole message when one button's data is too long: drop that button instead. The close
+    # button must leave room for its confirmation, ":y".
+    fits = lambda b: len(b["callback_data"].encode()) + (2 * b["callback_data"].startswith("ft:close:")) <= CALLBACK_LIMIT
+    rows = [r for r in ([b for b in row if fits(b)] for row in rows) if r]
     if rows:
         msg["reply_markup"] = {"inline_keyboard": rows}
     return msg

@@ -51,14 +51,15 @@ timer for `followthrough tick` and `notify-send` for notifications.
 
 ## Telegram buttons for other users
 
-The buttons ("Open on Mac", snooze) are opt-in (`open_button`, `snooze_buttons`, default off), because nothing in
+The buttons ("Open on Mac", snooze, close) are opt-in (`open_button`, `snooze_buttons`, `close_button`, default off), because nothing in
 this repo handles their callbacks: for a new user they would spin and do nothing. The author's handler lives in a
 separate personal bot.
 
 ### Ship the callback handler as a library function
 `followthrough.telegram.handle_update(update, cfg)`: accept only the configured chat and ids matching
 `^ft-[a-z0-9-]+$`, answer the callback, then run `open-terminal` (`ft:open:<id>`) or `snooze <id> --for <for>`
-(`ft:snooze:<id>:<for>`, `<for>` matching `timeparse.SNOOZE_RE`), and escape the CLI output before replying in HTML. An existing bot calls it. Cost of leaving it: every
+(`ft:snooze:<id>:<for>`, `<for>` matching `timeparse.SNOOZE_RE`) or, on the confirming second tap
+(`ft:close:<id>:y`), `abandon <id>`, and escape the CLI output before replying in HTML. An existing bot calls it. Cost of leaving it: every
 user who wants the button writes the security checks themselves, and copies drift from the callback format this
 repo sends.
 
