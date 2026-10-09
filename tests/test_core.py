@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import subprocess
 import sys
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -20,6 +21,7 @@ def con(tmp_path, monkeypatch):
     monkeypatch.setenv("FOLLOWTHROUGH_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(transcripts, "ROOT", str(tmp_path / "no-real-transcripts"))  # never read real sessions
     monkeypatch.setitem(config.DEFAULTS, "tz", LA)   # the tests use Pacific wall-clock times on any machine
+    monkeypatch.setitem(config.DEFAULTS, "digest", False)   # most tests run at real-clock times; digest tests set it
     fake = tmp_path / "bin" / "claude"                # `open` needs a claude binary; never depend on a real one
     fake.parent.mkdir()
     fake.write_text("#!/bin/sh\nexit 0\n")
@@ -1487,3 +1489,433 @@ def test_a_held_notice_that_became_obsolete_gives_way_to_the_reminder(con, cfg):
     s = Sender()
     tick(con, cfg, now=la_at(1, 12), send=s)
     assert s.events(cid) == ["reminder"]
+
+
+# ---------------------------------------------------------------- morning digest, short notices, stale buttons
+
+class DigestSender(Sender):
+    """A Sender that also takes digests (as notify.deliver_digest) and button edits (as notify.telegram_set_buttons).
+    Telegram sends return a message id, as the real one does for a message with buttons. `during` runs inside each
+    single send (to change the ledger mid-delivery); `edit_ok` is what an edit returns."""
+
+    def __init__(self, fail_first=0, during=None, edit_ok=True):
+        super().__init__(fail_first)
+        self.digests, self.edits, self.next_mid, self.during, self.edit_ok = [], [], 100, during, edit_ok
+
+    def _mid(self, channel):
+        self.next_mid += 1
+        return self.next_mid if channel == "telegram" else None
+
+    def __call__(self, cfg, channel, claim, cp, event, extra, bin_path):
+        if self.during:
+            self.during(channel, claim)
+        ok, detail = super().__call__(cfg, channel, claim, cp, event, extra, bin_path)
+        return ok, detail, (self._mid(channel) if ok else None)
+
+    def digest(self, cfg, channel, items, bin_path, total=None):
+        if self.fail > 0:
+            self.fail -= 1
+            return False, "boom"
+        if channel == "telegram":
+            self.digests.append([(it["claim"]["id"], it["event"]) for it in items])
+        return True, "ok", self._mid(channel)
+
+    def edit(self, cfg, chat_id, message_id, markup):
+        self.edits.append((message_id, [b["callback_data"] for r in (markup or {}).get("inline_keyboard", []) for b in r]))
+        return (True, "http 200") if self.edit_ok else (False, "http 502")
+
+
+@pytest.fixture
+def dcfg(cfg):
+    cfg["tz"], cfg["digest"] = LA, True
+    return cfg
+
+
+def _later(days=20):
+    return la_at(days, 9)
+
+
+def test_digest_one_message_a_day_and_only_final_due_alone(con, dcfg):
+    a = add(con, title="final check", dues=[(la_at(1, 9), "final")], ends_at=_later())
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    assert s.events() == ["due"] and s.digests == []           # a final checkpoint, alone
+    b = add(con, title="series", dues=[(la_at(1, 11), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+    tick(con, dcfg, now=la_at(1, 12), send=s)                  # an interim reading: the first digest of the day
+    assert s.digests == [[(b, "due")]] and s.events() == ["due"]
+    d = add(con, title="afternoon", dues=[(la_at(1, 14), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+    tick(con, dcfg, now=la_at(1, 15), send=s)                  # queued after today's digest: waits for tomorrow's
+    tick(con, dcfg, now=la_at(1, 20), send=s)
+    assert len(s.digests) == 1
+    tick(con, dcfg, now=la_at(2, 12) + dt.timedelta(minutes=5), send=s)   # a day later: one message for all three
+    tick(con, dcfg, now=la_at(2, 18), send=s)
+    assert s.events() == ["due"]
+    assert sorted(s.digests[1]) == sorted([(a, "reminder"), (b, "reminder"), (d, "due")])
+    assert db.kv_get(con, "digest:telegram") == la_at(2, 12).astimezone(ZoneInfo(LA)).date().isoformat()
+
+
+def test_a_final_due_joins_the_digest_that_goes_in_the_same_tick(con, dcfg):
+    a = add(con, title="a", dues=[(la_at(1, 9), "final")], ends_at=_later())
+    b = add(con, title="b", dues=[(la_at(1, 9), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    assert s.events() == [] and s.digests == [[(a, "due"), (b, "due")]]
+
+
+def test_digest_holds_night_notices_for_the_morning(con, dcfg):
+    a = add(con, dues=[(la_at(1, 22), "final")], ends_at=_later())
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 22) + dt.timedelta(minutes=5), send=s)
+    tick(con, dcfg, now=la_at(2, 3), send=s)
+    assert s.sent == [] and s.digests == []
+    tick(con, dcfg, now=la_at(2, 8), send=s)
+    assert s.sent == [] and s.digests == [[(a, "due")]]       # in the digest, not a separate 08:00 ping
+
+
+def test_digest_takes_retries_overdue_and_stale_but_not_a_snooze_end(con, dcfg):
+    retry = add(con, title="retry", dues=[(la_at(1, 9), "final")], ends_at=_later())
+    con.execute("UPDATE checkpoints SET tries=1 WHERE claim_id=?", (retry,))   # it came back after not_settled
+    late = add(con, title="late", dues=[(la_at(-5, 9), "final")], ends_at=la_at(-1, 9))
+    con.execute("UPDATE checkpoints SET state='needs_human', notified_at=? WHERE claim_id=?", (db.iso(la_at(-5, 10)), late))
+    stale = add(con, title="stale", dues=[(la_at(-1, 9), "final")], ends_at=_later())
+    att = core.start(con, stale, path="session", pid=99999999)   # a dead pid; its deadline passes before the tick
+    assert att[0] == "OK"
+    snz = add(con, title="snoozed", dues=[(la_at(1, 9), "final")], ends_at=_later())
+    core.snooze(con, snz, la_at(1, 11))
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    assert sorted(s.digests[0]) == sorted([(late, "overdue"), (retry, "due"), (stale, "stale")]) and s.events() == []
+    tick(con, dcfg, now=la_at(1, 11), send=s)                  # asked for at 11:00: its own message, the digest is spent
+    assert s.events(snz) == ["due"] and len(s.digests) == 1
+
+
+def test_a_snooze_ends_alone_even_after_the_days_digest(con, dcfg):
+    a = add(con, dues=[(la_at(1, 9), "final")], ends_at=_later())
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    core.snooze(con, a, la_at(2, 13))
+    db.kv_set(con, "digest:telegram", la_at(2, 9).astimezone(ZoneInfo(LA)).date().isoformat())   # the day's digest is out
+    tick(con, dcfg, now=la_at(2, 13), send=s)
+    assert s.events(a) == ["due", "reminder"]                   # the reminder asked for at 13:00, not tomorrow
+
+
+def test_digest_failure_retries_and_marks_every_row(con, dcfg):
+    a = add(con, title="a", dues=[(la_at(1, 9), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+    b = add(con, title="b", dues=[(la_at(1, 9), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+    s = DigestSender(fail_first=2)                              # both channels fail once
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    assert s.digests == [] and db.kv_get(con, "digest:telegram") == ""
+    assert {r["tries"] for r in con.execute("SELECT tries FROM outbox WHERE claim_id IN (?,?)", (a, b))} == {1}
+    tick(con, dcfg, now=la_at(1, 10) + dt.timedelta(minutes=5), send=s)
+    assert s.digests == [[(a, "due"), (b, "due")]]
+    assert not con.execute("SELECT 1 FROM outbox WHERE sent_at='' AND gave_up_at=''").fetchone()
+
+
+def test_digest_lines_that_do_not_fit_stay_queued(con, dcfg):
+    ids = [add(con, title=f"claim {i:02d}", dues=[(la_at(1, 9), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+           for i in range(notify.DIGEST_MAX + 5)]
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    assert [c for c, _ in s.digests[0]] == ids[:notify.DIGEST_MAX]
+    left = {r["claim_id"] for r in con.execute("SELECT claim_id FROM outbox WHERE channel='telegram' AND sent_at=''")}
+    assert left == set(ids[notify.DIGEST_MAX:])                # not marked sent unseen
+    tick(con, dcfg, now=la_at(2, 10) + dt.timedelta(minutes=5), send=s)
+    assert [c for c, _ in s.digests[1]][:5] == ids[notify.DIGEST_MAX:]   # the oldest waiting come first
+
+
+def test_digest_fits_text_and_buttons_to_the_same_claims(con, cfg):
+    cfg["telegram"].update(open_button=True, close_button=True)
+    ids = [add(con, title=f"<&> {i} " + "&" * 120) for i in range(notify.DIGEST_MAX)]
+    items = [{"claim": core.get(con, i), "cp": core.current_checkpoint(con, i), "event": "reminder", "extra": ""} for i in ids]
+    k = notify.digest_fit(items, LA, button=True)
+    text = notify.digest_text(items[:k], LA, button=True, total=len(items))
+    assert 1 < k < len(items) and len(text) <= notify.TELEGRAM_LIMIT and f"and {len(items) - k} more" in text
+    assert all(i in text for i in ids[:k]) and not any(i in text for i in ids[k:])
+    markup = notify.digest_markup(cfg, list(enumerate(ids[:k], 1)))
+    assert sum(len(r) for r in markup["inline_keyboard"]) == 2 * k
+
+
+def test_a_claim_closed_during_delivery_is_not_announced_on_the_next_channel(con, dcfg):
+    a = add(con, dues=[(la_at(1, 9), "final")], ends_at=_later())
+    s = DigestSender(during=lambda ch, c: ch == "macos" and core.resolve(con, c["id"], "worked", "measured meanwhile", checkpoint=1))
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    assert [(c, ch) for c, _, ch in s.sent] == [(a, "macos")]
+
+
+def test_one_bad_row_does_not_block_a_digest(con, dcfg, monkeypatch):
+    a = add(con, title="a", dues=[(la_at(1, 9), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+    b = add(con, title="b", dues=[(la_at(1, 9), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+    real = runner._still_relevant
+    monkeypatch.setattr(runner, "_still_relevant", lambda r, c, cp, now: (_ for _ in ()).throw(TypeError("bad"))
+                        if r["claim_id"] == a else real(r, c, cp, now))
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    assert s.digests == [[(b, "due")]]
+    assert {r["tries"] for r in con.execute("SELECT tries FROM outbox WHERE claim_id=? AND sent_at=''", (a,))} == {1}
+
+
+def test_digest_off_keeps_one_message_per_notice(con, cfg):
+    cfg["tz"] = LA
+    a = add(con, dues=[(la_at(1, 9), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+    s = DigestSender()
+    tick(con, cfg, now=la_at(1, 10), send=s)
+    assert s.events(a) == ["due"] and s.digests == []
+
+
+def test_several_notices_in_one_tick_become_one_message(con, dcfg):
+    c = add(con, title="c", dues=[(la_at(1, 8), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 8) + dt.timedelta(minutes=5), send=s)   # the day's digest
+    a = add(con, title="a", dues=[(la_at(1, 9), "final")], ends_at=_later())
+    b = add(con, title="b", dues=[(la_at(1, 9), "final")], ends_at=_later())
+    tick(con, dcfg, now=la_at(1, 10), send=s)                  # a Mac waking at 10:00: two due at once
+    assert s.events() == [] and s.digests == [[(c, "due")], [(a, "due"), (b, "due")]]
+    d = add(con, title="d", dues=[(la_at(1, 14), "final")], ends_at=_later())
+    tick(con, dcfg, now=la_at(1, 15), send=s)                  # one alone: its own message
+    assert s.events() == ["due"] and s.sent[-1][0] == d and len(s.digests) == 2
+
+
+def _tg_on(cfg):
+    cfg["telegram"].update(enabled=True, chat_id="1", open_button=True, close_button=True)
+
+
+def test_closed_claims_lose_their_buttons(con, dcfg):
+    _tg_on(dcfg)
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 7), send=s)                   # an empty morning: the digest is not spent
+    one = add(con, title="alone", dues=[(la_at(1, 9), "final")], ends_at=_later())
+    tick(con, dcfg, now=la_at(1, 9), send=s)                   # alone: a single message
+    b = add(con, title="b", dues=[(la_at(1, 10), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+    c = add(con, title="c", dues=[(la_at(1, 10), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+    tick(con, dcfg, now=la_at(1, 10), send=s)                  # the digest with b and c
+    (single, digest) = sorted({r["message_id"] for r in con.execute("SELECT message_id FROM sent_buttons")})
+    assert s.edits == []
+    core.close(con, one, "abandoned", "closed from Telegram")
+    core.close(con, b, "abandoned", "closed from Telegram")
+    tick(con, dcfg, now=la_at(1, 11), send=s)
+    assert sorted(s.edits) == [(single, []), (digest, [f"ft:open:{c}", f"ft:close:{c}"])]   # c keeps line 2's buttons
+    tick(con, dcfg, now=la_at(1, 12), send=s)
+    assert len(s.edits) == 2                                    # done once, not every tick
+    core.close(con, c, "abandoned", "x")
+    tick(con, dcfg, now=la_at(1, 13), send=s)
+    assert s.edits[-1] == (digest, [])
+    assert not con.execute("SELECT 1 FROM sent_buttons WHERE cleared_at=''").fetchone()
+
+
+def test_button_cleanup_backs_off_gives_up_and_has_no_age_limit(con, dcfg):
+    _tg_on(dcfg)
+    a = add(con, dues=[(la_at(1, 9), "final")], ends_at=_later(90))
+    s = DigestSender(edit_ok=False)
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    core.resolve(con, a, "worked", "measured", checkpoint=1)   # cleaned up 40 days after its message
+    now = la_at(40, 11)
+    for i in range(60):
+        tick(con, dcfg, now=now, send=s)
+        now += dt.timedelta(minutes=2)
+        if i == 5:
+            assert len(s.edits) == 3                            # minutes 0, 2 and 6 of the first ten: a backoff
+    row = con.execute("SELECT * FROM sent_buttons").fetchone()
+    assert len(s.edits) == runner.MAX_DELIVERY_TRIES               # backoff, not an edit every tick; then it gives up
+    assert row["cleared_at"] and row["last_error"] == "http 502"
+
+
+def test_button_cleanup_never_edits_in_another_chat(con, dcfg):
+    _tg_on(dcfg)
+    a = add(con, dues=[(la_at(1, 9), "final")], ends_at=_later())
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    core.resolve(con, a, "worked", "measured", checkpoint=1)
+    dcfg["telegram"]["chat_id"] = "2"
+    tick(con, dcfg, now=la_at(1, 11), send=s)
+    assert s.edits == [] and con.execute("SELECT last_error FROM sent_buttons").fetchone()[0] == "chat changed"
+
+
+def test_digest_markup_and_text(con, cfg):
+    cfg["telegram"].update(open_button=True, close_button=True)
+    ids = [add(con, title=f"check {i} sk-{'a' * 40}") for i in range(3)]
+    rows = notify.digest_markup(cfg, list(enumerate(ids, 1)))["inline_keyboard"]
+    assert [[b["text"] for b in r] for r in rows] == [["▶ 1", "✖ 1", "▶ 2", "✖ 2"], ["▶ 3", "✖ 3"]]
+    assert notify.digest_markup(cfg, [(1, "ft-" + "a" * 60)]) is None   # callback data too long: no button
+    items = [{"claim": core.get(con, i), "cp": core.current_checkpoint(con, i), "event": "reminder", "extra": ""} for i in ids]
+    text = notify.digest_text(items, LA, button=True, total=10)
+    assert "10 checks" in text and "and 7 more" in text and "sk-a" not in text
+    p = _TagCheck()
+    p.feed(text)
+    assert p.stack == []
+    con.execute("UPDATE claims SET title='<b>INJECTED</b>' WHERE id=?", (ids[0],))
+    items[0]["claim"] = core.get(con, ids[0])
+    assert "<b>INJECTED</b>" not in notify.digest_text(items[:1], LA)
+
+
+def test_telegram_notice_is_short_and_leaves_the_runbook_out(con):
+    cid = add(con, runbook="RUNBOOK-STEP " * 300, expectation="p95 below 10 s", change_ref="rev api-00051")
+    c, cp = core.get(con, cid), core.current_checkpoint(con, cid)
+    text = notify.telegram_text(c, cp, "due", "", LA, button=True)
+    assert "RUNBOOK-STEP" not in text and "p95 below 10 s" in text and "rev api-00051" in text and len(text) < 700
+    assert f"/ft open {cid}" in text and "resolve" not in text
+    assert "resolve" in notify.telegram_text(c, cp, "fired", "ran", LA)
+    assert "abandon" not in notify.telegram_text(c, None, "overdue", "", LA, close=True)
+
+
+def test_telegram_send_keeps_the_message_id_only_for_buttons(con, cfg, monkeypatch):
+    cfg["telegram"].update(enabled=True, chat_id="1", close_button=True)
+    monkeypatch.setattr(notify, "_read_env_value", lambda f, k: "tok")
+    monkeypatch.setattr(notify, "_tg_call", lambda c, m, p: ("200", {"ok": True, "result": {"message_id": 7}}))
+    cid = add(con)
+    assert notify.telegram(cfg, "x", cid, "due") == (True, "http 200", 7)
+    assert notify.telegram(cfg, "x", "ft-test", "test") == (True, "http 200", None)
+    cfg["telegram"]["close_button"] = False
+    assert notify.telegram(cfg, "x", cid, "due") == (True, "http 200", None)   # no buttons: nothing to clear later
+    for code, desc, done in (("200", "", True), ("400", "Bad Request: message is not modified: ...", True),
+                             ("400", "Bad Request: message to edit not found", True), ("400", "Bad Request: chat not found", False),
+                             ("400", None, False), ("", None, False), ("502", None, False), ("429", None, False),
+                             ("403", None, False), ("401", None, False)):
+        body = {"ok": False, "description": desc} if desc is not None else None
+        monkeypatch.setattr(notify, "_tg_call", lambda c, m, p, code=code, body=body: (code, body))
+        assert notify.telegram_set_buttons(cfg, "1", 7, None)[0] is done, (code, desc)
+
+
+def test_notify_test_runs_with_telegram_on(con, monkeypatch, capsys, tmp_path):
+    (tmp_path / "home" / "config.toml").write_text('[macos]\nenabled = false\n[telegram]\nenabled = true\nchat_id = "1"\n'
+                                                  'env_file = "x"\nclose_button = true\n')
+    monkeypatch.setattr(notify, "_read_env_value", lambda f, k: "tok")
+    monkeypatch.setattr(notify, "_tg_call", lambda c, m, p: ("200", {"ok": True, "result": {"message_id": 7}}))
+    assert cli.main(["notify-test"]) == 0
+    assert "telegram" in capsys.readouterr().out
+
+
+def test_digest_column_is_added_to_an_old_ledger(tmp_path, monkeypatch):
+    import sqlite3
+    monkeypatch.setenv("FOLLOWTHROUGH_HOME", str(tmp_path / "h"))
+    db.connect().close()
+    c = sqlite3.connect(tmp_path / "h" / "data" / "followthrough.db")
+    for ev, sent in (("reminder", ""), ("due", ""), ("overdue", "2026-10-01T00:00:00Z")):
+        c.execute("INSERT INTO outbox(claim_id, event, channel, created_at, next_try_at, sent_at) VALUES (?,?,?,?,?,?)",
+                  ("ft-x", ev, "telegram", "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z", sent))
+    c.execute("ALTER TABLE outbox DROP COLUMN digest")
+    c.execute("DROP TABLE sent_buttons")
+    c.execute("DROP TABLE kv")
+    c.execute("PRAGMA user_version=4")
+    c.commit()
+    c.close()
+    con = db.connect()
+    assert "digest" in {r[1] for r in con.execute("PRAGMA table_info(outbox)")}
+    assert [tuple(r) for r in con.execute("SELECT event, digest FROM outbox ORDER BY id")] == [
+        ("reminder", 1), ("due", 0), ("overdue", 0)]          # queued reminders wait for the digest; sent rows untouched
+    db.kv_set(con, "k", "v")
+    assert db.kv_get(con, "k") == "v"
+
+
+def test_a_retry_after_not_settled_waits_for_the_digest(con, dcfg):
+    today = la_at(1, 9).astimezone(ZoneInfo(LA)).date().isoformat()
+    db.kv_set(con, "digest:telegram", today)                  # today's digest has gone
+    a = add(con, dues=[(la_at(1, 9), "final")], ends_at=_later())
+    con.execute("UPDATE checkpoints SET tries=1 WHERE claim_id=?", (a,))
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    assert s.events() == []
+    tick(con, dcfg, now=la_at(2, 8), send=s)
+    assert s.digests == [[(a, "due")]]
+
+
+def test_a_daytime_notice_still_retrying_next_morning_is_not_held_as_a_night_one(con, dcfg):
+    a = add(con, dues=[(la_at(1, 14), "final")], ends_at=_later())
+    s = DigestSender(fail_first=2)                              # both channels fail at 14:05
+    tick(con, dcfg, now=la_at(1, 14) + dt.timedelta(minutes=5), send=s)
+    con.execute("UPDATE outbox SET next_try_at=? WHERE claim_id=?", (db.iso(la_at(2, 9)), a))   # still backing off
+    db.kv_set(con, "digest:telegram", la_at(2, 8).astimezone(ZoneInfo(LA)).date().isoformat())   # the day's digest is out
+    tick(con, dcfg, now=la_at(2, 9), send=s)
+    assert s.events(a) == ["due"] and s.digests == []
+
+
+def _needs_you(con, cid, at):
+    con.execute("UPDATE checkpoints SET state='needs_human', notified_at=? WHERE claim_id=?", (db.iso(at), cid))
+    return core.current_checkpoint(con, cid)["id"]
+
+
+def test_a_malformed_row_does_not_block_delivery(con, dcfg):
+    a = add(con, dues=[(la_at(1, 9), "final")], ends_at=_later())
+    db.enqueue(con, a, _needs_you(con, a, la_at(1, 9)), "due", at=la_at(1, 9))
+    con.execute("UPDATE outbox SET created_at='bad', tries='x' WHERE claim_id=? AND channel='macos'", (a,))
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    assert s.events(a) == ["due"]                               # the telegram row still goes
+    tick(con, dcfg, now=la_at(1, 10) + dt.timedelta(minutes=2), send=s)
+    assert not con.execute("SELECT 1 FROM outbox WHERE sent_at='' AND gave_up_at=''").fetchone()   # no resend loop
+
+
+def test_a_line_that_cannot_be_drawn_fails_alone(con, dcfg, monkeypatch):
+    a = add(con, title="a", dues=[(la_at(1, 9), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+    b = add(con, title="b", dues=[(la_at(1, 9), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+    real = notify.digest_text
+    monkeypatch.setattr(notify, "digest_text", lambda items, *x, **k: (_ for _ in ()).throw(TypeError("blob"))
+                        if any(it["claim"]["id"] == a for it in items) else real(items, *x, **k))
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    assert s.digests == [[(b, "due")]]
+    assert {r["tries"] for r in con.execute("SELECT tries FROM outbox WHERE claim_id=?", (a,))} == {1}
+
+
+def test_an_obsolete_row_does_not_spend_the_days_digest(con, dcfg):
+    x = add(con, title="x", dues=[(la_at(1, 9), "final")], ends_at=_later())
+    db.enqueue(con, x, _needs_you(con, x, la_at(1, 9)), "reminder", at=la_at(1, 9), digest=True)
+    core.resolve(con, x, "worked", "measured", checkpoint=1)        # the reminder is now obsolete
+    y = add(con, title="y", dues=[(la_at(1, 9), "final")], ends_at=_later())
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    assert s.events() == ["due"] and s.digests == [] and db.kv_get(con, "digest:telegram") == ""
+
+
+def test_one_claim_with_two_notices_gets_one_message(con, dcfg):
+    a = add(con, dues=[(la_at(1, 9), "final")], ends_at=_later())
+    cp = _needs_you(con, a, la_at(1, 9))
+    db.enqueue(con, a, cp, "due", at=la_at(1, 9))
+    db.enqueue(con, a, cp, "fired", "ran", at=la_at(1, 9))
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    assert s.events(a) == ["fired"]
+
+
+def test_a_merged_digest_keeps_queue_order_and_the_newest_notice(con, dcfg):
+    x = add(con, title="x", dues=[(la_at(1, 9), "final")], ends_at=_later())
+    y = add(con, title="y", dues=[(la_at(1, 9), "final")], ends_at=_later())
+    cx, cy = _needs_you(con, x, la_at(1, 9)), _needs_you(con, y, la_at(1, 9))
+    db.enqueue(con, x, cx, "due", at=la_at(1, 9))                       # alone, oldest
+    db.enqueue(con, y, cy, "reminder", at=la_at(1, 9), digest=True)
+    db.enqueue(con, x, cx, "reminder", at=la_at(1, 9), digest=True)     # x's newest
+    s = DigestSender()
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    assert s.digests == [[(x, "reminder"), (y, "reminder")]]
+
+
+def test_cleanup_backoff_is_per_message(con, dcfg):
+    _tg_on(dcfg)
+    a = add(con, title="a", dues=[(la_at(1, 9), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+    b = add(con, title="b", dues=[(la_at(1, 9), "interim"), (la_at(9, 9), "final")], ends_at=_later())
+    s = DigestSender(edit_ok=False)
+    tick(con, dcfg, now=la_at(1, 10), send=s)
+    core.close(con, a, "abandoned", "x")
+    tick(con, dcfg, now=la_at(1, 11), send=s)                   # try 1 fails; the message backs off 2 min
+    core.close(con, b, "abandoned", "x")
+    tick(con, dcfg, now=la_at(1, 11) + dt.timedelta(minutes=1), send=s)   # b closing does not skip the backoff
+    assert len(s.edits) == 1
+    assert {r["tries"] for r in con.execute("SELECT tries FROM sent_buttons WHERE claim_id=?", (a,))} == {1}
+
+
+def test_migration_sends_old_interim_and_retry_notices_to_the_digest(tmp_path, monkeypatch):
+    import sqlite3
+    monkeypatch.setenv("FOLLOWTHROUGH_HOME", str(tmp_path / "h"))
+    con = db.connect()
+    cid = core.add_claim(con, title="t", kind="verify", dues=[(t(1), "interim"), (t(2), "final")])[0]
+    (i, f) = [r["id"] for r in con.execute("SELECT id FROM checkpoints WHERE claim_id=? ORDER BY seq", (cid,))]
+    con.close()
+    c = sqlite3.connect(tmp_path / "h" / "data" / "followthrough.db")
+    for cp in (i, f):
+        c.execute("INSERT INTO outbox(claim_id, checkpoint_id, event, channel, created_at, next_try_at) VALUES (?,?,?,?,?,?)",
+                  (cid, cp, "due", "telegram", "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z"))
+    c.execute("ALTER TABLE outbox DROP COLUMN digest")
+    c.execute("PRAGMA user_version=4")
+    c.commit()
+    c.close()
+    con = db.connect()
+    assert [tuple(r) for r in con.execute("SELECT checkpoint_id, digest FROM outbox ORDER BY id")] == [(i, 1), (f, 0)]

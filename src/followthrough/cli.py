@@ -588,6 +588,7 @@ tz = "{tz}"   # the zone your sessions run in: cron times of reminders are read 
 # user_names = ["Sam"]   # "ask Sam" / "reminder for Sam" in a reminder -> kind `ask` (a decision for you)
 # ignore_paths = []      # never capture sessions under these folders
 # grace_minutes = 30     # how long a live session gets to run its own reminder first
+# digest = true         # reminders, overdue notices and night notices: one morning message instead of many
 
 [macos]
 enabled = true

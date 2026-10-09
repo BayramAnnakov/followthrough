@@ -14,9 +14,13 @@ skill). How it works, the decisions behind it, the first week's numbers and what
   next 7 days of fires) - notice when they fire, move due checks to "needs you", notify, and flag claims still
   without a verdict after their end time as overdue (they stay open until you record a verdict or cancel them).
 - Notifications: macOS (with `terminal-notifier`, clicking opens a Terminal running `followthrough open <id>`, a
-  Claude session for the check) and, optionally, Telegram with the check's details and as much of the runbook as
-  fits. When a reminder ran in its session but recorded no verdict, the Telegram notice carries that session's last
-  reply. (The interim readings of a daily series that ran in their session are not notified; `status` shows them.)
+  Claude session for the check) and, optionally, Telegram with the change, the expectation and buttons (the runbook
+  stays in the ledger for the session that runs the check). When a reminder ran in its session but recorded no
+  verdict, the Telegram notice carries that session's last reply (when it goes on its own). Only a final checkpoint that is due (or ran in its
+  session without a verdict), a check still not settled after three tries and the end of a snooze get a message of
+  their own, in waking hours (08:00-21:00); reminders, overdue notices, interim readings, retries and anything
+  queued at night come as one morning digest per channel (`digest = false` turns this off). (The interim readings
+  of a daily series that ran in their session are not notified; `status` shows them.)
 - Nothing runs an agent unattended.
 
 ## Install
@@ -53,8 +57,10 @@ By hand afterwards:
   `followthrough snooze <id> --for <for> --source telegram-button`. `close_button = true` ends that row with a
   "close" button, `ft:close:<id>` (it adds a button: `snooze_buttons = ["3h", "morning"]` with it gives "3h, till
   9:00, close"), for closing a check without running it: the handler asks for a second tap
-  (`ft:close:<id>:y`) and then runs `followthrough abandon <id> --reason "…"`. followthrough does not ship that
-  handler yet.
+  (`ft:close:<id>:y`) and then runs `followthrough abandon <id> --reason "…"`. A digest has an open and a close
+  button per line ("▶ 2", "✖ 2"), with the same callback data; a handler that edits a pressed message's buttons should
+  touch only the buttons of that claim. Once a claim closes, the runner removes its buttons from the messages it sent.
+  followthrough does not ship that handler yet.
 - Codex: add `~/.followthrough/data` to `[sandbox_workspace_write] writable_roots` in `~/.codex/config.toml`, and a
   line to `~/.codex/AGENTS.md` pointing at the skill.
 
@@ -68,7 +74,8 @@ followthrough add "p95 after cache fix" --at +2m --expect "p95 below 10 s" \
 followthrough status                          # one open claim, due in 2 minutes
 ```
 
-Within about 4 minutes the runner moves it to "needs you" and notifies you. Click the notification (or run
+Within about 4 minutes the runner moves it to "needs you" and notifies you (between 08:00 and 21:00; at night the
+notice waits for the morning digest). Click the notification (or run
 `followthrough open <id>`): a Claude session starts in the repo with the check's instructions, takes the lease
 (`followthrough start`), does the check and records the verdict (`followthrough resolve`). `followthrough show <id>`
 prints the history.

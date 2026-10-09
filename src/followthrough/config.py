@@ -30,6 +30,11 @@ DEFAULTS = {
     "ignore_paths": [],           # sessions under these folders are never captured (e.g. an isolated bot)
     "user_names": [],             # names your reminders call you ("ask Sam", "reminder for Sam") -> kind "ask"
     "renotify_hours": 24,         # repeat a "needs you" notification at most this often
+    # digest: reminders, overdue notices, interim readings and anything queued at night go out as one message per
+    # channel in the morning; only a final checkpoint that is due gets its own message (in waking hours, 08-21).
+    # false: every notice is its own message, as soon as it is queued (reminders and overdue notices still wait for
+    # waking hours).
+    "digest": True,
     "attempt_deadline_hours": 3,  # an interactive attempt that never resolves becomes "needs you" again
     "claude_bin": "",             # absolute path to claude; found on PATH when empty
     "macos": {"enabled": True, "terminal_app": "Terminal"},
