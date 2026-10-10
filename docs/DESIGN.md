@@ -86,16 +86,29 @@ A launchd job runs `followthrough tick` every 2 minutes. Each tick, in this orde
    claims are handled here too.
 3. **Deliver** the outbox. Every notification is queued in the same transaction as the transition that caused it
    and re-checked against the ledger right before sending, so a check resolved in the meantime is never announced.
+4. **Clear buttons.** A Telegram message whose claim has closed loses its buttons, so an old message cannot be
+   tapped; a digest keeps the buttons of its claims that are still open.
 
 ### Notifications and opening a check
 
-macOS notifications (clickable with `terminal-notifier`) and, optionally, Telegram with the full runbook. Clicking
+macOS notifications (clickable with `terminal-notifier`) and, optionally, Telegram: the title, the change, the
+expectation and buttons, not the runbook (the session that runs the check reads it from the ledger). Clicking
 runs `followthrough open <id>`: an interactive Claude session in the claim's repo, with the check's instructions in
 a private prompt file. When the runbook refers to "this conversation", the session is forked from the one that set
 the reminder, so the context comes back.
 
-Reminders and overdue notices are sent only between 08:00 and 21:00 local time; due and fired notices are sent
-when they happen.
+Only a final checkpoint that is due (or ran in its session without a verdict), a check that is still not settled
+after three tries and the end of a snooze get a message of their own, between 08:00 and 21:00 local time; when
+several are ready in the same tick (a Mac waking up, snoozes ending together), they share one message.
+Everything else waits for the **morning digest**: reminders, overdue notices, interim readings, retries after
+`not_settled`, stale attempts, and anything queued at night. The digest is one message per channel per local day,
+sent at the first tick in waking hours that has something to say, one line per claim; notices that would go alone in
+that tick join it. It lists at most 15 claims and only as many as fit one Telegram message; the rest stay queued for
+the next one, so nothing is marked sent unseen. On Telegram each line has its own open and close buttons; on macOS
+clicking the digest opens `followthrough status`. In the first two weeks of
+live use, about half of all messages were the second or later message about the same claim, and one in five arrived
+at night; the digest is the answer to both. `digest = false` in the config goes back to one message per notice
+(reminders and overdue notices still wait for waking hours).
 
 `followthrough snooze <id> --for 3h` (or a Telegram snooze button) holds a claim's notifications. Nothing else
 changes: checkpoints still become due, and what they queue waits in the outbox. When the snooze ends, you get one
@@ -157,4 +170,4 @@ The author's machine, 23-27 Sep 2026 (one person, one week - read the numbers as
   collectors with no model at all) is designed but not built; today every check is opened by a person.
 - **The Telegram button handler** ("Open on Mac", snooze, close). The buttons are opt-in; something that polls the bot's
   updates has to handle them, and nothing in this repo does yet.
-- **Quiet hours for due and fired notices**, and the other known gaps in `BACKLOG.md`.
+- The known gaps in `BACKLOG.md`.

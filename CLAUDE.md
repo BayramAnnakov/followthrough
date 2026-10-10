@@ -50,7 +50,10 @@ No venv yet: `uv venv .venv && uv pip install -e . pytest`.
   must stay first). "It fired in its session" is detected structurally (`scheduledTaskId` == job id), never by
   matching prompt text.
 - **Notifications** go only through the `outbox` table (`db.enqueue`). They are re-checked against the ledger
-  right before sending (`_still_relevant`).
+  right before sending (`_still_relevant`). `enqueue(digest=True)` marks a notice that waits for the one morning
+  digest per channel (`runner.deliver`, the `kv` table holds the day it was sent), and so does anything queued at
+  night; a due or fired final checkpoint, an exhausted retry and a snooze end go alone in waking hours. Telegram
+  message ids with buttons go in `sent_buttons`, and `runner.clear_buttons` removes them when the claim closes.
 
 ## Invariants
 
@@ -74,7 +77,8 @@ No venv yet: `uv venv .venv && uv pip install -e . pytest`.
 All tests are in `tests/test_core.py`. Use the `con` fixture: it points `FOLLOWTHROUGH_HOME` and
 `transcripts.ROOT` at `tmp_path`, so no test touches the real ledger or real transcripts. Helpers: `Transcript`
 writes fake session `.jsonl` files, `Sender` is a fake notifier, and `t()` / `NOW` give fixed times. Pass `now=`
-explicitly instead of sleeping.
+explicitly instead of sleeping. The fixture turns the morning digest off, because most tests run at real-clock times;
+digest tests use the `dcfg` fixture, fixed local times (`la_at`) and `DigestSender`.
 
 ## Elsewhere
 

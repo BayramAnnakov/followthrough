@@ -43,8 +43,27 @@ A prompt that starts with `[followthrough claim <id>]` or `This is followthrough
 
 ## When you ship a change with an expected effect
 
-Register it while the session still knows the details - the check may be run by a fresh session with none of
-this context.
+Register a check only when both hold:
+
+- **The answer needs time to exist** - traffic, users, replies, a billing export, a scheduled run that has not
+  happened yet. If you can check it now, check it now, in this session, and tell the user what you saw.
+- **Someone would act on it** - a `worked` or a `failed` would change what the user does next (keep, revert, roll
+  out, decide).
+
+Do not register:
+
+- "Is it still up / still available / did the deploy finish / is the page live" - verify it now. Catching a later
+  regression is a monitor's job, not a follow-up.
+- Readiness checks before an event or a send ("verify the calendar before the session") - do them now, or tell
+  the user what to look at.
+- A second claim for the same change. When a new release or revision replaces one you already registered, add it
+  to the existing claim: `followthrough note <id> "now serving rev X, image Y - check that one"`, and copy any new
+  files with `followthrough attach <id> <files>`. Only when the check itself changes (a new expectation or a new
+  date), add the new claim first, then `followthrough cancel <old id> --reason "superseded by <new id>"`.
+
+Every check costs the user a notification and a decision; a user who gets many low-value checks stops reading all
+of them. Register it while the session still knows the details - the check may be run by a fresh session with
+none of this context.
 
 - **What changed** - read it from the running system (the revision or image that is serving, the label version
   that is live, the ad change in the account history), not from git: `--change`.
@@ -54,7 +73,8 @@ this context.
 - **The baseline, measured now** with the same query the check will use, plus a control that the change should
   not move, when one exists.
 - **When to look** - after the data settles (billing exports lag about a day; small samples need days):
-  `--at +24h --at +7d`. Several `--at` flags make interim checkpoints; the last one is final.
+  `--at +24h --at +7d`. Several `--at` flags make interim checkpoints; the last one is final. Interim readings
+  reach the user only in a morning digest: add one only when its reading could change a decision.
 - **A self-contained runbook** - where to read, which command or query, what to compare, what the instrument
   cannot see, and "read-only; never print secrets": `--runbook-file <file>` or `--runbook "..."`. The ledger
   stores the runbook's text. Refer to credentials by name (an env var, a secret store); never paste a secret into

@@ -1,6 +1,9 @@
-"""Notifications: macOS (clickable - opens the claim's session) and Telegram (full context + an "Open on Mac" button).
+"""Notifications: macOS (clickable - opens the claim's session) and Telegram (short: what changed, what to expect,
+and buttons; the runbook stays in the ledger for the session that runs the check). Reminders, overdue notices and
+interim readings wait for one morning digest per channel (runner.deliver).
 
-`deliver_channel` never raises: it returns (ok, detail) and the runner's outbox retries failures. Secrets: the
+`deliver_channel` never raises: it returns (ok, detail), plus the Telegram message id when the message has buttons,
+and the runner's outbox retries failures. Secrets: the
 Telegram token is read from an env file at send time, passed to curl on stdin (never argv), and never logged; errors
 are reported by type or HTTP status only.
 """
@@ -91,43 +94,114 @@ def _cut(s, n):
     return s if len(s) <= n else s[: n - 1].rstrip() + "…"
 
 
-def telegram_text(claim, cp, event, extra, tz, button=False):
-    """HTML for Telegram, at most TELEGRAM_LIMIT characters. Secret-shaped strings are redacted; fields are truncated
-    before escaping, so the markup is never cut; the runbook gets whatever room is left."""
+def telegram_text(claim, cp, event, extra, tz, button=False, close=False):
+    """Short HTML for Telegram: the title, what changed, what to expect, and how to open it. The runbook is not sent:
+    the session that runs the check reads it from the ledger. Secret-shaped strings are redacted; fields are cut
+    before escaping, so the markup is never cut."""
     def e(t, n=None):   # redact the whole value, then cut, then escape: a cut must never split a secret
         t = core.redact(str(t))
         return html.escape(_cut(t, n) if n else t)
-    head = [f"<b>⏰ followthrough · {e(HEADLINES.get(event, event))}</b>", f"<b>{e(claim['title'], 200)}</b>", ""]
+    lines = [f"<b>⏰ followthrough · {e(HEADLINES.get(event, event))}</b>", f"<b>{e(claim['title'], 200)}</b>"]
     meta = [f"kind: {e(claim['kind'], 20)}"]
     if claim["repo"]:
-        meta.append(f"repo: {e(claim['repo'].replace(os.path.expanduser('~'), '~'), 120)}")
+        meta.append(f"repo: {e(claim['repo'].replace(os.path.expanduser('~'), '~'), 80)}")
     if cp is not None:
         meta.append(f"checkpoint {int(cp['seq'])} ({e(cp['role'], 20)}), due {e(timeparse.local_str(db.parse(cp['due_at']), tz))}")
-    head.append(" · ".join(meta))
+    lines.append(" · ".join(meta))
     if claim["change_ref"]:
-        head.append(f"<b>Change:</b> {e(claim['change_ref'], 300)}")
+        lines.append(f"<b>Change:</b> {e(claim['change_ref'], 160)}")
     if claim["expectation"]:
-        head.append(f"<b>Expected:</b> {e(claim['expectation'], 600)}")
+        lines.append(f"<b>Expected:</b> {e(claim['expectation'], 300)}")
     if extra:
         first, reply = extra.partition("\n\n")[::2] if event == "fired" else (extra, "")   # reply after a blank line
-        head.append(f"<i>{e(first, 300)}</i>")
+        lines.append(f"<i>{e(first, 300)}</i>")
         if reply:
-            head.append(f"<b>Its last reply:</b>\n{e(reply, 1600)}")
-    hint = f"  (or the button, or <code>/ft open {claim['id']}</code>)" if button else ""
-    tail = ["", f"▶ <code>followthrough open {claim['id']}</code>{hint}",
-            f"✓ <code>followthrough resolve {claim['id']} --verdict worked|failed|partial|inconclusive --summary \"…\"</code>"]
-    if event == "overdue":
-        tail.append(f"✗ no longer needed: <code>followthrough abandon {claim['id']} --reason \"…\"</code>")
-    fixed = "\n".join(head + tail)
-    rb = core.redact(claim["runbook"] or "")
-    room = TELEGRAM_LIMIT - len(fixed) - len("\n\n<b>Runbook:</b>\n") - 10
-    if rb and room > 80:
-        raw = rb
-        while raw and len(e(raw)) > room:
-            raw = raw[: int(len(raw) * 0.85)]
-        body = e(raw) + (" …" if len(raw) < len(rb) else "")
-        return "\n".join(head + ["", "<b>Runbook:</b>", body] + tail)
-    return fixed
+            lines.append(f"<b>Its last reply:</b>\n{e(reply, 900)}")
+    lines.append("")
+    lines.append(f"▶ <code>/ft open {claim['id']}</code>" if button else f"▶ <code>followthrough open {claim['id']}</code>")
+    if event in ("fired", "stale", "exhausted"):
+        lines.append(f"✓ <code>followthrough resolve {claim['id']} --verdict worked|failed|partial|inconclusive --summary \"…\"</code>")
+    if event == "overdue" and not close:
+        lines.append(f"✗ no longer needed: <code>followthrough abandon {claim['id']} --reason \"…\"</code>")
+    return _cut_lines(lines)
+
+
+def _cut_lines(lines):
+    """Join lines, dropping whole lines from the end of the body (never the markup inside one) past the limit."""
+    text = "\n".join(lines)
+    while len(text) > TELEGRAM_LIMIT and len(lines) > 2:
+        lines = lines[:-2] + lines[-1:]
+        text = "\n".join(lines)
+    return text
+
+
+DIGEST_MAX = 15          # lines in one digest at most; the rest stay queued for the next message
+DIGEST_LABELS = {
+    "due": "due", "fired": "ran in its session, verdict missing", "reminder": "waiting for you",
+    "stale": "started, never resolved", "exhausted": "not settled after 3 tries", "overdue": "overdue",
+}
+
+
+def _digest_label(item):
+    cp, ev = item["cp"], item["event"]
+    label = DIGEST_LABELS.get(ev, ev)
+    if ev == "due" and cp is not None and cp["tries"]:
+        label = "due again (retry after not settled)"
+    elif ev == "due" and cp is not None and cp["role"] == "interim":
+        label = "interim reading due"
+    return label
+
+
+def digest_text(items, tz, button=False, total=None):
+    """One message for many claims. items: [{"claim", "cp", "event", "extra"}], one per claim, all of them listed;
+    `total` counts the ones left for a later message too. Use digest_fit to pick how many items fit."""
+    def e(t, n):
+        return html.escape(_cut(core.redact(str(t)), n))
+    n = total or len(items)
+    lines = [f"<b>☀️ followthrough · {n} check{'s' if n != 1 else ''} wait{'' if n != 1 else 's'} for you</b>", ""]
+    for i, it in enumerate(items, 1):
+        c = it["claim"]
+        where = str(c["repo"] or "").replace(os.path.expanduser("~"), "~").rstrip("/").rsplit("/", 1)[-1]
+        lines.append(f"{i}. <b>{e(c['title'], 90)}</b>")
+        lines.append(f"    {e(_digest_label(it), 60)}{' · ' + e(where, 40) if where else ''} · <code>{e(c['id'], 70)}</code>")
+    if n > len(items):
+        lines.append(f"…and {n - len(items)} more, in the next message: "
+                     f"<code>{'/ft status' if button else 'followthrough status'}</code>")
+    lines += ["", ("Open one with the buttons below, or" if button else "Open one:")
+              + f" <code>{'/ft open' if button else 'followthrough open'} &lt;id&gt;</code>"]
+    return "\n".join(lines)
+
+
+def digest_fit(items, tz, button=False):
+    """How many of `items` one message can list: at most DIGEST_MAX, and within Telegram's length limit. The text,
+    the buttons and the notices marked sent all come from that many, so nothing is acknowledged unseen."""
+    k = min(len(items), DIGEST_MAX)
+    while k > 1 and len(digest_text(items[:k], tz, button, total=len(items))) > TELEGRAM_LIMIT:
+        k -= 1
+    return k
+
+
+def digest_markup(cfg, pairs):
+    """Buttons for a digest: per line "▶ n" (open) and "✖ n" (close), two lines per row. pairs: [(n, claim_id)]."""
+    t = cfg["telegram"]
+    buttons = []
+    for n, cid in pairs:
+        pair = []
+        if t.get("open_button"):
+            pair.append({"text": f"▶ {n}", "callback_data": f"ft:open:{cid}"})
+        if t.get("close_button"):
+            pair.append({"text": f"✖ {n}", "callback_data": f"ft:close:{cid}"})
+        pair = [b for b in pair if _fits(b)]
+        if pair:
+            buttons.append(pair)
+    rows = [sum(buttons[i:i + 2], []) for i in range(0, len(buttons), 2)]
+    return {"inline_keyboard": rows} if rows else None
+
+
+def _fits(b):
+    """Telegram rejects the whole message when one button's data is too long: such a button is dropped instead. The
+    close button must leave room for its confirmation, ":y"."""
+    return len(b["callback_data"].encode()) + (2 * b["callback_data"].startswith("ft:close:")) <= CALLBACK_LIMIT
 
 
 CALLBACK_LIMIT = 64   # bytes of callback_data Telegram accepts
@@ -153,35 +227,33 @@ def telegram_message(cfg, text, claim_id="", event=""):
         if t.get("close_button"):
             row.append({"text": "✖ close", "callback_data": f"ft:close:{claim_id}"})
         rows.append(row)
-    # Telegram rejects the whole message when one button's data is too long: drop that button instead. The close
-    # button must leave room for its confirmation, ":y".
-    fits = lambda b: len(b["callback_data"].encode()) + (2 * b["callback_data"].startswith("ft:close:")) <= CALLBACK_LIMIT
-    rows = [r for r in ([b for b in row if fits(b)] for row in rows) if r]
+    rows = [r for r in ([b for b in row if _fits(b)] for row in rows) if r]
     if rows:
         msg["reply_markup"] = {"inline_keyboard": rows}
     return msg
 
 
-def telegram(cfg, text, claim_id="", event=""):
-    t = cfg["telegram"]
-    if not t.get("enabled"):
-        return True, "disabled"
-    token = _read_env_value(t.get("env_file", ""), t.get("token_key", "BOT_TOKEN"))
-    if not token or not t.get("chat_id"):
-        return False, "telegram not configured (token or chat_id missing)"
-    msg = telegram_message(cfg, text, claim_id, event)
+def _tg_call(cfg, method, payload):
+    """POST one Bot API call. Returns (http status, parsed JSON body or None). The token goes to curl on stdin."""
+    token = _read_env_value(cfg["telegram"].get("env_file", ""), cfg["telegram"].get("token_key", "BOT_TOKEN"))
+    if not token:
+        return "", None
     tmp = None
     try:
         fd, tmp = tempfile.mkstemp(prefix="ft-tg-", suffix=".json")
         with os.fdopen(fd, "w") as fh:
-            json.dump(msg, fh)
-        cfg_stdin = (f'url = "https://api.telegram.org/bot{token}/sendMessage"\n'
+            json.dump(payload, fh)
+        cfg_stdin = (f'url = "https://api.telegram.org/bot{token}/{method}"\n'
                      f'header = "Content-Type: application/json"\n'
                      f'data-binary = "@{tmp}"\n')
-        r = subprocess.run(["curl", "-s", "--max-time", "20", "-o", "/dev/null", "-w", "%{http_code}", "-K", "-"],
+        r = subprocess.run(["curl", "-s", "--max-time", "20", "-w", "\n%{http_code}", "-K", "-"],
                            input=cfg_stdin, capture_output=True, text=True, timeout=30)
-        code = r.stdout.strip()
-        return code == "200", f"http {code or 'none'}"
+        body, _, code = r.stdout.rpartition("\n")
+        try:
+            parsed = json.loads(body) if body else None
+        except ValueError:
+            parsed = None
+        return code.strip(), parsed
     finally:
         if tmp:
             try:
@@ -190,19 +262,93 @@ def telegram(cfg, text, claim_id="", event=""):
                 pass
 
 
+def _send_message(cfg, msg):
+    """sendMessage. Returns (ok, detail, message_id): the id only when the message has buttons, so they can be
+    removed once their claim closes (runner.clear_buttons)."""
+    t = cfg["telegram"]
+    if not t.get("enabled"):
+        return True, "disabled", None
+    if not t.get("chat_id") or not _read_env_value(t.get("env_file", ""), t.get("token_key", "BOT_TOKEN")):
+        return False, "telegram not configured (token or chat_id missing)", None
+    code, body = _tg_call(cfg, "sendMessage", msg)
+    mid = None
+    if code == "200" and "reply_markup" in msg and isinstance(body, dict):
+        mid = (body.get("result") or {}).get("message_id")
+        mid = mid if isinstance(mid, int) else None
+    return code == "200", f"http {code or 'none'}", mid
+
+
+def telegram(cfg, text, claim_id="", event=""):
+    return _send_message(cfg, telegram_message(cfg, text, claim_id, event))
+
+
+def telegram_set_buttons(cfg, chat_id, message_id, markup):
+    """Replace a sent message's buttons (markup None removes them). Returns (done, detail): done for 200, and for a 400
+    that says the message already has these buttons or is gone; anything else (no answer, another 400, 401/403, 429,
+    5xx) is for the caller to retry with backoff and then give up."""
+    body = {"chat_id": str(chat_id), "message_id": int(message_id)}
+    if markup:
+        body["reply_markup"] = markup
+    code, resp = _tg_call(cfg, "editMessageReplyMarkup", body)
+    desc = str((resp or {}).get("description", "")).lower() if isinstance(resp, dict) else ""
+    settled = code == "400" and any(s in desc for s in EDIT_SETTLED)
+    return code == "200" or settled, f"http {code or 'none'}" + (f" ({desc[:80]})" if code == "400" else "")
+
+
+EDIT_SETTLED = ("message is not modified", "message to edit not found", "message can't be edited")
+
+
 def deliver_channel(cfg, channel, claim, cp, event, extra, bin_path):
     """Send one notification on one channel. Never raises."""
     try:
         if channel == "macos":
             return macos(cfg, claim, event, bin_path)
         if channel == "telegram":
-            text = telegram_text(claim, cp, event, extra, claim["tz"] or cfg["tz"], button=cfg["telegram"].get("open_button"))
+            text = telegram_text(claim, cp, event, extra, claim["tz"] or cfg["tz"], button=cfg["telegram"].get("open_button"),
+                                 close=cfg["telegram"].get("close_button"))
             return telegram(cfg, text, claim["id"], event)
         return False, f"unknown channel {channel}"
     except Exception as e:  # noqa: BLE001
         return False, type(e).__name__
 
 
+def macos_digest(cfg, items, bin_path, total=None):
+    if not cfg["macos"].get("enabled", True):
+        return True, "disabled"
+    n = total or len(items)
+    title = f"followthrough · {n} check{'s' if n != 1 else ''} wait{'' if n != 1 else 's'} for you"
+    subtitle = core.redact(items[0]["claim"]["title"])[:60] + (f" and {n - 1} more" if n > 1 else "")
+    tn = _terminal_notifier()
+    command = f"{shlex.quote(bin_path)} status"
+    if tn:
+        execute = " ".join(shlex.quote(x) for x in terminal_osascript_args(cfg["macos"].get("terminal_app", "Terminal"), command))
+        args = [tn, "-title", title, "-subtitle", subtitle, "-message", "click to see them", "-group", "ft-digest",
+                "-execute", execute, "-sound", "default"]
+    else:
+        esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')  # noqa: E731
+        args = ["osascript", "-e", f'display notification "run: followthrough status" with title "{esc(title)}" subtitle "{esc(subtitle)}"']
+    r = subprocess.run(args, capture_output=True, timeout=20)
+    return r.returncode == 0, f"exit {r.returncode}"
+
+
+def deliver_digest(cfg, channel, items, bin_path, total=None):
+    """Send one digest listing `items` (one per claim, already fitted with digest_fit; `total` counts the rest too) on
+    one channel. Returns (ok, detail[, message_id]). Never raises."""
+    try:
+        if channel == "macos":
+            return macos_digest(cfg, items, bin_path, total)
+        if channel == "telegram":
+            msg = {"chat_id": str(cfg["telegram"].get("chat_id", "")), "parse_mode": "HTML", "disable_web_page_preview": True,
+                   "text": digest_text(items, cfg["tz"], button=cfg["telegram"].get("open_button"), total=total)}
+            markup = digest_markup(cfg, list(enumerate((it["claim"]["id"] for it in items), 1)))
+            if markup:
+                msg["reply_markup"] = markup
+            return _send_message(cfg, msg)
+        return False, f"unknown channel {channel}"
+    except Exception as e:  # noqa: BLE001
+        return False, type(e).__name__
+
+
 def send_all(cfg, claim, cp, event, extra, bin_path):
-    """Immediate send on every channel (used by notify-test)."""
-    return {ch: deliver_channel(cfg, ch, claim, cp, event, extra, bin_path) for ch in db.CHANNELS}
+    """Immediate send on every channel (used by notify-test). Returns {channel: (ok, detail)}."""
+    return {ch: tuple(deliver_channel(cfg, ch, claim, cp, event, extra, bin_path))[:2] for ch in db.CHANNELS}

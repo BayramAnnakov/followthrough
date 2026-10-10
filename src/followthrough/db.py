@@ -75,7 +75,24 @@ CREATE TABLE IF NOT EXISTS outbox (          -- notifications are queued in the 
     tries INTEGER NOT NULL DEFAULT 0,
     sent_at TEXT NOT NULL DEFAULT '',
     gave_up_at TEXT NOT NULL DEFAULT '',
-    last_error TEXT NOT NULL DEFAULT ''
+    last_error TEXT NOT NULL DEFAULT '',
+    digest INTEGER NOT NULL DEFAULT 0        -- 1: waits for the next morning digest instead of its own message
+);
+CREATE TABLE IF NOT EXISTS sent_buttons (    -- Telegram messages with buttons, so a closed claim's buttons can go
+    chat_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    claim_id TEXT NOT NULL,
+    idx INTEGER NOT NULL DEFAULT 0,          -- 0: a message about one claim; n: line n of a digest
+    sent_at TEXT NOT NULL,
+    cleared_at TEXT NOT NULL DEFAULT '',     -- set when its buttons are gone, or when removing them gave up
+    tries INTEGER NOT NULL DEFAULT 0,
+    next_try_at TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (chat_id, message_id, claim_id)
+);
+CREATE TABLE IF NOT EXISTS kv (              -- small runner state, e.g. the local date of the last digest per channel
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
@@ -115,8 +132,9 @@ MIGRATIONS = [  # (table, column, DDL) for databases created before the column e
     ("claims", "confirmed", "ALTER TABLE claims ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 1"),
     ("attempts", "pid_start", "ALTER TABLE attempts ADD COLUMN pid_start TEXT NOT NULL DEFAULT ''"),
     ("claims", "snoozed_until", "ALTER TABLE claims ADD COLUMN snoozed_until TEXT NOT NULL DEFAULT ''"),
+    ("outbox", "digest", "ALTER TABLE outbox ADD COLUMN digest INTEGER NOT NULL DEFAULT 0"),
 ]
-SCHEMA_VERSION = 4   # bump with every SCHEMA/MIGRATIONS change; connect() skips all schema work when current
+SCHEMA_VERSION = 5   # bump with every SCHEMA/MIGRATIONS change; connect() skips all schema work when current
 
 FMT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -176,13 +194,14 @@ def connect(fast=False):
         if con.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             con.execute("PRAGMA journal_mode=WAL")
             for table, column, ddl in MIGRATIONS:
-                cols = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
-                if cols and column not in cols:
-                    try:
+                with tx(con):       # under the write lock: no other process adds it meanwhile, and a backfill commits with it
+                    cols = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+                    if cols and column not in cols:
                         con.execute(ddl)
-                    except sqlite3.OperationalError as e:   # another process added it first
-                        if "duplicate column" not in str(e):
-                            raise
+                        if (table, column) == ("outbox", "digest"):   # queued before the digest: what would wait for it
+                            con.execute("UPDATE outbox SET digest=1 WHERE sent_at='' AND gave_up_at='' AND (event IN"
+                                        " ('reminder', 'overdue', 'stale') OR (event IN ('due', 'fired') AND checkpoint_id IN"
+                                        " (SELECT id FROM checkpoints WHERE role='interim' OR tries>0)))")
             con.executescript(SCHEMA)
             con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     finally:
@@ -224,9 +243,19 @@ def event(con, claim_id, kind, detail="", at=None):
 CHANNELS = ("macos", "telegram")
 
 
-def enqueue(con, claim_id, checkpoint_id, event_name, extra="", at=None):
-    """Queue a notification on every channel. Call inside the transaction that made the transition."""
+def enqueue(con, claim_id, checkpoint_id, event_name, extra="", at=None, digest=False):
+    """Queue a notification on every channel. Call inside the transaction that made the transition. `digest`: it
+    can wait for the next morning digest (a reminder, an interim reading) instead of going out on its own."""
     t = iso(at or now())
     for ch in CHANNELS:
-        con.execute("INSERT INTO outbox(claim_id, checkpoint_id, event, extra, channel, created_at, next_try_at)"
-                    " VALUES (?,?,?,?,?,?,?)", (claim_id, checkpoint_id, event_name, extra, ch, t, t))
+        con.execute("INSERT INTO outbox(claim_id, checkpoint_id, event, extra, channel, created_at, next_try_at, digest)"
+                    " VALUES (?,?,?,?,?,?,?,?)", (claim_id, checkpoint_id, event_name, extra, ch, t, t, int(digest)))
+
+
+def kv_get(con, key):
+    r = con.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+    return r[0] if r else ""
+
+
+def kv_set(con, key, value):
+    con.execute("INSERT INTO kv(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))

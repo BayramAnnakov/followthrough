@@ -6,12 +6,15 @@ checks) and in code reviews.
 
 ## Notifications and timing
 
-### `due`, `fired` and `stale` notify at night
-Only reminders and `overdue` notices respect waking hours (08:00-21:00). A check added with `--at +24h` late at
-night is due late the next night too; in the first week 5 of 33 notifications arrived between 21:00 and 08:00.
-Cost of leaving it: a phone ping at 3 AM for a check nobody can act on until morning. Fix: hold `due`, `fired`
-and `stale` until 08:00 local (the send-time check already drops them if the claim was resolved overnight), or
-send them silently.
+### `due`, `fired` and `stale` notify at night when the digest is off
+With `digest = true` (the default) anything queued at night waits for the morning digest. With `digest = false`
+only reminders and `overdue` notices respect waking hours. Cost of leaving it: a phone ping at 3 AM for users who
+turned the digest off. Fix: hold them until 08:00 in that mode too.
+
+### Buttons on messages sent before the digest release stay live
+The runner removes a closed claim's buttons only from messages whose Telegram message id it stored, which it does
+since the digest release. Older messages keep working buttons; tapping one on a closed claim answers "already
+closed" and changes nothing. Cost of leaving it: clutter in the chat history only.
 
 ### Grace applies to claims that no session can fire
 Grace (30 min for the setting session to run its own reminder) is applied whenever `source_session_id` is set,
