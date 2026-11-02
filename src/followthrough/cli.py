@@ -429,6 +429,7 @@ def cmd_open(a):
         print(f"cd {cwd}\n" + " ".join(args) + "\n---\n" + prompt)
         return 0
     os.environ["FOLLOWTHROUGH_PARENT_CLAIM"] = c["id"]
+    os.environ["CLAUDE_CONFIG_DIR"] = config.claude_dir(cfg)   # the check runs in the profile that set the reminder
     os.chdir(cwd)
     os.execv(claude, args)
 
@@ -481,6 +482,7 @@ def cmd_import_crons(a):
 
 
 def cmd_install_runner(a):
+    _use_claude_dir(getattr(a, "claude_dir", None))
     bin_path = _bin()
     home = os.path.expanduser("~")
     logdir = config.path("logs")
@@ -488,14 +490,17 @@ def cmd_install_runner(a):
     for f in ("tick.log", "tick.err"):
         if os.path.exists(os.path.join(logdir, f)):
             os.chmod(os.path.join(logdir, f), 0o600)
+    env = {"PATH": f"{home}/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+           "HOME": home, "FOLLOWTHROUGH_HOME": config.home()}
+    if config.claude_dir() != os.path.expanduser(config.DEFAULT_CLAUDE_DIR):   # tick scans this profile's transcripts
+        env["CLAUDE_CONFIG_DIR"] = config.claude_dir()
     plist = {
         "Label": LABEL,
         "ProgramArguments": [bin_path, "tick"],
         "StartInterval": a.interval,
         "RunAtLoad": True,
         "Umask": 0o077,
-        "EnvironmentVariables": {"PATH": f"{home}/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
-                                 "HOME": home, "FOLLOWTHROUGH_HOME": config.home()},
+        "EnvironmentVariables": env,
         "StandardOutPath": os.path.join(logdir, "tick.log"),
         "StandardErrorPath": os.path.join(logdir, "tick.err"),
     }
@@ -532,7 +537,8 @@ def _strip_ours(groups):
 def cmd_install_hooks(a):
     """Merge followthrough's hooks into a Claude Code settings file (idempotent; backs the file up first).
     Prints only event names - settings files can hold secrets."""
-    path = os.path.expanduser(a.settings)
+    _use_claude_dir(getattr(a, "claude_dir", None))
+    path = os.path.expanduser(a.settings or os.path.join(config.claude_dir(), "settings.json"))
     data = {}
     if os.path.exists(path):
         with open(path) as fh:
@@ -580,13 +586,21 @@ def cmd_install_hooks(a):
     return 0
 
 
-SKILL_TARGETS = ("~/.claude/skills/followthrough", "~/.codex/skills/followthrough")
+def _skill_targets(codex=True):
+    return [os.path.join(config.claude_dir(), "skills", "followthrough")] + (["~/.codex/skills/followthrough"] if codex else [])
+
+
+def _use_claude_dir(arg):
+    """--claude-dir DIR: serve that Claude Code profile (CLAUDE_CONFIG_DIR) for the rest of this command."""
+    if arg:
+        os.environ["CLAUDE_CONFIG_DIR"] = os.path.abspath(os.path.expanduser(arg))
 
 
 STARTER_CONFIG = """# followthrough settings (defaults: followthrough/config.py). Uncomment a line to change it.
 tz = "{tz}"   # the zone your sessions run in: cron times of reminders are read in it
 # user_names = ["Sam"]   # "ask Sam" / "reminder for Sam" in a reminder -> kind `ask` (a decision for you)
 # ignore_paths = []      # never capture sessions under these folders
+# claude_dir = "~/.claude"   # the Claude Code profile (CLAUDE_CONFIG_DIR) whose sessions are served; `install --claude-dir` sets it
 # grace_minutes = 30     # how long a live session gets to run its own reminder first
 # digest = true         # reminders, overdue notices and night notices: one morning message instead of many
 
@@ -614,11 +628,31 @@ def _write_starter_config():
     return p
 
 
+def _pin_claude_dir(d):
+    """Record a non-default profile as `claude_dir` in config.toml, above its first table (an existing line is
+    replaced). The runner and a notification click start without CLAUDE_CONFIG_DIR, so they read it from here."""
+    if d == os.path.expanduser(config.DEFAULT_CLAUDE_DIR):
+        return
+    p = config.path("config.toml")
+    line = f"claude_dir = {json.dumps(d)}"
+    lines = open(p).read().splitlines()
+    for i, l in enumerate(lines):
+        if re.match(r"claude_dir\s*=", l):
+            lines[i] = line
+            break
+    else:
+        at = next((i for i, l in enumerate(lines) if l.startswith("[")), len(lines))
+        lines[at:at] = [line] + ([""] if at < len(lines) else [])
+    with open(p, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
 def cmd_install(a):
     """One command for a new machine: the skill for Claude Code and Codex, the hooks, the runner, and what is left
     to configure by hand."""
+    _use_claude_dir(a.claude_dir)
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SKILL.md")
-    for t in SKILL_TARGETS:
+    for t in _skill_targets(not a.no_codex):
         d = os.path.expanduser(t)
         if os.path.islink(d):
             os.unlink(d)
@@ -630,6 +664,8 @@ def cmd_install(a):
         print(f"skill -> {dst}")
     if _write_starter_config():
         print(f"config -> {config.path('config.toml')}")
+    _pin_claude_dir(config.claude_dir())
+    print(f"claude profile -> {config.claude_dir()}")
     cmd_install_hooks(argparse.Namespace(settings=a.settings, remove=False, session_start=not a.no_session_start))
     rc = cmd_install_runner(argparse.Namespace(interval=a.interval))
     if rc:
@@ -639,8 +675,9 @@ def cmd_install(a):
     print(f"\nNext steps:\n  - check the time zone used for reminders: tz = {cfg['tz']!r} in {config.path('config.toml')}"
           f"\n  - clickable macOS notifications need: brew install terminal-notifier"
           f"\n  - optional Telegram: set [telegram] enabled, env_file, token_key, chat_id in the config"
-          f"\n  - Codex sandbox: add {config.data_path()} to [sandbox_workspace_write] writable_roots in ~/.codex/config.toml"
-          f"\n  - Codex: add a line to ~/.codex/AGENTS.md pointing at the followthrough skill")
+          + ("" if a.no_codex else
+             f"\n  - Codex sandbox: add {config.data_path()} to [sandbox_workspace_write] writable_roots in ~/.codex/config.toml"
+             f"\n  - Codex: add a line to ~/.codex/AGENTS.md pointing at the followthrough skill"))
     return 1 if rc else 0
 
 
@@ -742,16 +779,20 @@ def main(argv=None):
 
     s = sub.add_parser("install-runner", help="install the launchd job")
     s.add_argument("--interval", type=int, default=120), s.set_defaults(fn=cmd_install_runner)
+    s.add_argument("--claude-dir", help="Claude Code profile folder to serve (default: $CLAUDE_CONFIG_DIR or ~/.claude)")
     s = sub.add_parser("uninstall-runner", help="remove the launchd job")
     s.set_defaults(fn=cmd_uninstall_runner)
 
     s = sub.add_parser("install-hooks", help="add followthrough's hooks to a Claude Code settings file")
-    s.add_argument("--settings", default="~/.claude/settings.json"), s.add_argument("--remove", action="store_true")
+    s.add_argument("--settings", help="default: <claude profile>/settings.json"), s.add_argument("--remove", action="store_true")
+    s.add_argument("--claude-dir", help="Claude Code profile folder to serve (default: $CLAUDE_CONFIG_DIR or ~/.claude)")
     s.add_argument("--session-start", action="store_true", help="also show open claims at session start")
     s.set_defaults(fn=cmd_install_hooks)
 
     s = sub.add_parser("install", help="install everything: skill (Claude Code + Codex), hooks, launchd runner")
-    s.add_argument("--settings", default="~/.claude/settings.json"), s.add_argument("--no-session-start", action="store_true")
+    s.add_argument("--settings", help="default: <claude profile>/settings.json"), s.add_argument("--no-session-start", action="store_true")
+    s.add_argument("--claude-dir", help="Claude Code profile folder to serve (default: $CLAUDE_CONFIG_DIR or ~/.claude)")
+    s.add_argument("--no-codex", action="store_true", help="do not install the skill for Codex")
     s.add_argument("--interval", type=int, default=120), s.add_argument("--link", action="store_true",
                                                                          help="symlink the skill instead of copying it")
     s.set_defaults(fn=cmd_install)

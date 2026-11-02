@@ -63,7 +63,7 @@ session id plus the `CronCreate` tool-call id:
 1. A `PreToolUse` hook on `CronCreate` creates a provisional claim and prefixes the reminder's prompt with a claim
    line ("take the lease, do the check, record the verdict"). The session keeps its reminder.
 2. `PostToolUse` links the job id and confirms the claim; `PostToolUseFailure` cancels it.
-3. The runner scans the transcripts (`~/.claude/projects/*/*.jsonl`, incrementally by byte offset) as a backstop
+3. The runner scans the transcripts (`<profile>/projects/*/*.jsonl`, `~/.claude` unless `CLAUDE_CONFIG_DIR` / config `claude_dir` names another; incrementally by byte offset) as a backstop
    for sessions that were killed before a hook could finish.
 
 A cancelled capture is a tombstone: a rescan never brings it back. Short waits (under 30 minutes) and sub-daily
