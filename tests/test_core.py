@@ -1959,3 +1959,12 @@ def test_install_hooks_defaults_to_the_profile_settings_file(con, tmp_path, monk
     cli.main(["install-hooks", "--claude-dir", str(prof)])
     assert "PreToolUse" in json.load(open(prof / "settings.json"))["hooks"]
     assert cli._skill_targets(codex=False) == [str(prof / "skills" / "followthrough")]
+
+
+def test_open_exports_the_profile_only_when_it_is_not_the_default(con, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "x")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")             # recorded, so the export below is undone after the test
+    cli._export_profile(config.load())
+    assert "CLAUDE_CONFIG_DIR" not in os.environ        # a default install must see no new variable
+    cli._export_profile({"claude_dir": "/tmp/profile-x"})
+    assert os.environ["CLAUDE_CONFIG_DIR"] == "/tmp/profile-x"

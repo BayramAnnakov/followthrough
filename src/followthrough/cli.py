@@ -406,6 +406,15 @@ def _claude_bin(cfg):
     return cand
 
 
+def _export_profile(cfg):
+    """Start the check in the profile that set the reminder. Only for a non-default profile: with the variable set
+    Claude Code reads <dir>/.claude.json instead of ~/.claude.json, so setting it to ~/.claude would change the
+    login and MCP config a default install sees."""
+    d = config.claude_dir(cfg)
+    if d != os.path.abspath(os.path.expanduser(config.DEFAULT_CLAUDE_DIR)):
+        os.environ["CLAUDE_CONFIG_DIR"] = d
+
+
 def cmd_open(a):
     con, cfg = db.connect(), _cfg()
     c = core.get(con, a.id)
@@ -429,7 +438,7 @@ def cmd_open(a):
         print(f"cd {cwd}\n" + " ".join(args) + "\n---\n" + prompt)
         return 0
     os.environ["FOLLOWTHROUGH_PARENT_CLAIM"] = c["id"]
-    os.environ["CLAUDE_CONFIG_DIR"] = config.claude_dir(cfg)   # the check runs in the profile that set the reminder
+    _export_profile(cfg)
     os.chdir(cwd)
     os.execv(claude, args)
 
