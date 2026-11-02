@@ -29,11 +29,15 @@ skill). How it works, the decisions behind it, the first week's numbers and what
 git clone https://github.com/BayramAnnakov/followthrough
 uv tool install ./followthrough               # puts `followthrough` on PATH (~/.local/bin); -e to hack on it
 followthrough install                         # skill (Claude Code + Codex), hooks, launchd runner; prints next steps
+followthrough install --claude-dir ~/.claude-work --no-codex   # one Claude Code profile only, no Codex
 ```
 
 `followthrough install` changes your machine, so read this first. It:
 
-- copies the skill into `~/.claude/skills/followthrough/` and `~/.codex/skills/followthrough/`;
+- copies the skill into `~/.claude/skills/followthrough/` and `~/.codex/skills/followthrough/` (`--no-codex` skips
+  the second). With `$CLAUDE_CONFIG_DIR` set, or `--claude-dir DIR`, `~/.claude` below means that profile folder
+  everywhere, and a non-default one is recorded as `claude_dir` in `config.toml` (the runner and notification clicks
+  read it from there);
 - writes a commented `~/.followthrough/config.toml` if there is none;
 - merges its hooks into `~/.claude/settings.json` (backed up first as `settings.json.bak-followthrough-<time>`;
   `--no-session-start` skips the session-start overview) and adds the ledger's `data/` folder to
@@ -85,7 +89,8 @@ prints the history.
 - macOS (launchd, `osascript`). Linux scheduling is not written yet.
 - `git` (claims are filed under the repo you are in) and `ps` (to tell whether a check's agent is still running).
 - Python 3.11+ and `uv`.
-- Claude Code transcripts in `~/.claude/projects/`. The scanner reads their structure (`CronCreate` results,
+- Claude Code transcripts in `<profile>/projects/` (`~/.claude` unless `$CLAUDE_CONFIG_DIR` or `claude_dir` says otherwise);
+  only that one profile is scanned. The scanner reads their structure (`CronCreate` results,
   `CronDelete` results, `scheduledTaskId` on fired prompts); a Claude Code format change can break capture.
 - Layout: `~/.followthrough/config.toml` (trusted settings), `data/` (the ledger and `attachments/` - the only part
   an agent sandbox needs to write), `prompts/`, `logs/`.

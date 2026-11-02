@@ -1919,3 +1919,52 @@ def test_migration_sends_old_interim_and_retry_notices_to_the_digest(tmp_path, m
     c.close()
     con = db.connect()
     assert [tuple(r) for r in con.execute("SELECT checkpoint_id, digest FROM outbox ORDER BY id")] == [(i, 1), (f, 0)]
+
+
+def test_claude_profile_comes_from_the_env_then_the_config_then_the_default(con, monkeypatch):
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    assert config.claude_dir() == os.path.expanduser("~/.claude")
+    assert config.claude_dir({"claude_dir": "~/.claude-work"}) == os.path.expanduser("~/.claude-work")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/tmp/profile-x")
+    assert config.claude_dir({"claude_dir": "~/.claude-work"}) == "/tmp/profile-x"
+
+
+def test_the_transcript_scan_reads_only_the_active_profile(con, tmp_path, monkeypatch):
+    monkeypatch.setattr(transcripts, "ROOT", "")
+    work, other = tmp_path / "work", tmp_path / "other"
+    for prof in (work, other):
+        (prof / "projects" / "p").mkdir(parents=True)
+        (prof / "projects" / "p" / f"{prof.name}-sess.jsonl").write_text("{}\n")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(work))
+    assert transcripts.find("work-sess") and transcripts.find("other-sess") is None
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    open(config.path("config.toml"), "w").write(f'claude_dir = "{other}"\n')
+    assert transcripts.find("other-sess") and transcripts.find("work-sess") is None
+
+
+def test_install_pins_a_non_default_profile_above_the_config_tables(con, tmp_path):
+    import tomllib
+    cli._write_starter_config()
+    cli._pin_claude_dir(str(tmp_path / "prof"))
+    cli._pin_claude_dir(str(tmp_path / "prof2"))          # a second run replaces the line, never duplicates it
+    cfg = tomllib.load(open(config.path("config.toml"), "rb"))
+    assert cfg["claude_dir"] == str(tmp_path / "prof2") and cfg["telegram"]["enabled"] is False
+    assert open(config.path("config.toml")).read().count("claude_dir =") == 2   # the pinned line + the commented example
+
+
+def test_install_hooks_defaults_to_the_profile_settings_file(con, tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/nonexistent")   # restored after; --claude-dir sets it for the command
+    prof = tmp_path / "prof"
+    prof.mkdir()
+    cli.main(["install-hooks", "--claude-dir", str(prof)])
+    assert "PreToolUse" in json.load(open(prof / "settings.json"))["hooks"]
+    assert cli._skill_targets(codex=False) == [str(prof / "skills" / "followthrough")]
+
+
+def test_open_exports_the_profile_only_when_it_is_not_the_default(con, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "x")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")             # recorded, so the export below is undone after the test
+    cli._export_profile(config.load())
+    assert "CLAUDE_CONFIG_DIR" not in os.environ        # a default install must see no new variable
+    cli._export_profile({"claude_dir": "/tmp/profile-x"})
+    assert os.environ["CLAUDE_CONFIG_DIR"] == "/tmp/profile-x"
