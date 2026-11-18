@@ -37,6 +37,9 @@ DEFAULTS = {
     "digest": True,
     "attempt_deadline_hours": 3,  # an interactive attempt that never resolves becomes "needs you" again
     "claude_bin": "",             # absolute path to claude; found on PATH when empty
+    # Claude Code profile folder whose sessions followthrough serves (transcripts, skill, hooks, checker sessions).
+    # Empty: $CLAUDE_CONFIG_DIR if set, else ~/.claude. `followthrough install --claude-dir DIR` fills it in.
+    "claude_dir": "",
     "macos": {"enabled": True, "terminal_app": "Terminal"},
     # open_button: an "Open on Mac" button + `/ft open` hint. Only useful when a process polling this bot's updates
     # handles callback data "ft:open:<id>" (by running `followthrough open-terminal <id>`); nothing here does.
@@ -59,6 +62,17 @@ def path(*parts):
 
 def data_path(*parts):
     return os.path.join(home(), "data", *parts)
+
+
+DEFAULT_CLAUDE_DIR = "~/.claude"
+
+
+def claude_dir(cfg=None):
+    """The Claude Code profile folder in use: $CLAUDE_CONFIG_DIR (what Claude Code itself reads, so a hook or a
+    checker running inside a profile always sees its own), else `claude_dir` in config.toml (the launchd runner and
+    notification clicks have no such variable), else ~/.claude."""
+    d = os.environ.get("CLAUDE_CONFIG_DIR") or (cfg if cfg is not None else load()).get("claude_dir") or DEFAULT_CLAUDE_DIR
+    return os.path.abspath(os.path.expanduser(d))
 
 
 def _merge(base, over):

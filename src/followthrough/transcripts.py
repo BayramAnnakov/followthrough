@@ -1,4 +1,4 @@
-"""Incremental scan of Claude Code transcripts (~/.claude/projects/*/*.jsonl).
+"""Incremental scan of Claude Code transcripts (<claude profile dir>/projects/*/*.jsonl; ~/.claude by default).
 
 Structural, not textual: a reminder is captured only when its CronCreate call has a successful result carrying the
 job id (`toolUseResult.id`); a CronDelete of that id cancels it; a user record with `scheduledTaskId` equal to the
@@ -15,7 +15,7 @@ import time
 
 from . import config, core, db, timeparse
 
-ROOT = os.path.expanduser("~/.claude/projects")
+ROOT = ""   # tests point this at a scratch folder; empty: the active Claude Code profile (config.claude_dir)
 MARKERS = (b'"CronCreate"', b'"CronDelete"', b'"humanSchedule"', b'"scheduledTaskId"')
 OVERDUE_LOOKBACK = dt.timedelta(hours=48)   # a reminder first seen after its due time is still imported this late
 MAX_WATCH_CHECKPOINTS = 8
@@ -24,10 +24,14 @@ MAX_WATCH_CHECKPOINTS = 8
 SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 
 
+def _projects(root=None):
+    return root or ROOT or os.path.join(config.claude_dir(), "projects")
+
+
 def find(session_id, root=None):
     if not isinstance(session_id, str) or not SESSION_RE.fullmatch(session_id):   # a file name, never a path or glob
         return None
-    hits = glob.glob(os.path.join(root or ROOT, "*", f"{session_id}.jsonl"))
+    hits = glob.glob(os.path.join(_projects(root), "*", f"{session_id}.jsonl"))
     return hits[0] if hits else None
 
 
@@ -110,7 +114,7 @@ def _process_record(con, cfg, now, sid, rec, log):
 def scan(con, cfg, now=None, root=None, lookback_days=45, budget_s=20.0):
     """Read new transcript bytes since the last scan. Returns log lines. Never raises for a bad file."""
     now = now or db.now()
-    root = root or ROOT
+    root = _projects(root)
     log, started = [], time.monotonic()
     cutoff = now.timestamp() - lookback_days * 86400
     try:
